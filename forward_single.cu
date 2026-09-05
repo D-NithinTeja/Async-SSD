@@ -1,5 +1,5 @@
 // forward_single.cu
-// Single-GPU forward pass and benchmarking implementations.
+// Single-GPU forward pass implementations.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -102,13 +102,9 @@ void forward_model(
 // ---------------------------------------------------------------------------
 // Activation buffer
 // ---------------------------------------------------------------------------
-static int max_activation_dim(const ModelConfig& cfg) {
-  return (cfg.q_dim() > cfg.d_ff) ? cfg.q_dim() : cfg.d_ff;
-}
-
 ActivationBuffers alloc_activations(const ModelConfig& cfg, int M) {
   ActivationBuffers buf;
-  int max_dim = max_activation_dim(cfg);
+  int max_dim = std::max(cfg.q_dim(), cfg.d_ffn);
   CHECK_CUDA(cudaMalloc(
     &buf.x, static_cast<size_t>(M) * cfg.d_model * sizeof(half)
   ));
