@@ -1,7 +1,7 @@
 # Makefile
 
 NVCC      = nvcc
-CXX_HOST  = /usr/bin/g++-11
+CXX_HOST  = /usr/bin/g++-13
 EXTRA_FLAGS ?=
 NVCCFLAGS = -O2 -ccbin $(CXX_HOST) -std=c++17 $(EXTRA_FLAGS)
 LIBS      = -lcublas
@@ -19,7 +19,8 @@ SRCS = $(SRC_DIR)/main.cu \
        $(SRC_DIR)/bench_common.cu \
        $(SRC_DIR)/bench_ar.cu \
        $(SRC_DIR)/bench_sd.cu \
-       $(SRC_DIR)/bench_ssd.cu
+       $(SRC_DIR)/bench_ssd.cu \
+       $(SRC_DIR)/bench_ssd_single.cu
 
 # Headers (for dependency tracking)
 HDRS = $(SRC_DIR)/config.h \
@@ -30,7 +31,9 @@ HDRS = $(SRC_DIR)/config.h \
        $(SRC_DIR)/bench_common.h \
        $(SRC_DIR)/bench_ar.h \
        $(SRC_DIR)/bench_sd.h \
-       $(SRC_DIR)/bench_ssd.h
+       $(SRC_DIR)/bench_ssd.h \
+       $(SRC_DIR)/bench_ssd_single.h \
+       $(SRC_DIR)/thread_safe_queue.h
 
 ifeq ($(USE_NCCL),1)
   NVCCFLAGS += -DUSE_NCCL

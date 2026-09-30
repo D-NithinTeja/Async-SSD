@@ -17,6 +17,10 @@ static double gb(size_t bytes) {
   return bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
+static bool is_ssd_mode(const std::string& mode) {
+  return mode == "ssd" || mode == "ssd-single";
+}
+
 // ---------------------------------------------------------------------------
 // Header
 // ---------------------------------------------------------------------------
@@ -26,7 +30,8 @@ void print_bench_header(const BenchInfo& info) {
   printf("--- %s Benchmark ---\n",
          info.mode == "ar"  ? "AR" :
          info.mode == "sd"  ? "SD" :
-         info.mode == "ssd" ? "SSD" : info.mode.c_str());
+         info.mode == "ssd" ? "SSD" :
+         info.mode == "ssd-single" ? "SSD Single-GPU" : info.mode.c_str());
   printf("  Target: %s (d=%d, L=%d)\n", t.name.c_str(), t.d_model, t.n_layers);
   if (info.draft) {
     const ModelConfig& d = *info.draft;
@@ -43,6 +48,9 @@ void print_bench_header(const BenchInfo& info) {
   } else if (info.mode == "ssd") {
     printf("  TP=%d (+1 draft GPU), K=%d, F=%d, alpha=%.2f, phit=%.2f, N=%d\n",
            info.tp, info.K, info.F, info.alpha, info.phit, info.N);
+  } else if (info.mode == "ssd-single") {
+    printf("  One GPU, two worker threads, K=%d, F=%d, alpha=%.2f, phit=%.2f, N=%d\n",
+           info.K, info.F, info.alpha, info.phit, info.N);
   }
 
   // Fit info
@@ -101,7 +109,7 @@ void print_result(const BenchInfo& info, const BenchResult& br) {
   printf("    Avg rounds:   %.1f\n", br.avg_rounds);
   if (br.avg_rounds > 0.0f)
     printf("    Tokens/round: %.2f\n", br.avg_tokens / br.avg_rounds);
-  if (info.mode == "ssd")
+  if (is_ssd_mode(info.mode))
     printf("    Miss rate:    %.2f  (expected 1 - phit = %.2f)\n",
            br.miss_rate, 1.0f - info.phit);
   printf("    E2E time:     %.2f ms\n", br.e2e_ms);

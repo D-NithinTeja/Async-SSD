@@ -12,6 +12,7 @@
 #include "bench_ar.h"
 #include "bench_sd.h"
 #include "bench_ssd.h"
+#include "bench_ssd_single.h"
 
 // ---------------------------------------------------------------------------
 // CLI helpers
@@ -24,7 +25,7 @@ static void print_usage(const std::string& prog) {
     "  --target-model <name>   Target model (tiny, llama-1b, llama-8b, llama-70b)  [llama-8b]\n"
     "  --draft-model  <name>   Draft model  (tiny, llama-1b, llama-8b, llama-70b)  [llama-1b]\n"
     "  --tp           <int>    Tensor parallelism degree                     [1]\n"
-    "  --mode         <str>    Inference mode (ar, sd, ssd)                  [ar]\n"
+    "  --mode         <str>    Inference mode (ar, sd, ssd, ssd-single)      [ar]\n"
     "  --K            <int>    Speculation length (sd/ssd only)              [4]\n"
     "  --F            <int>    Fan-out for pre-speculation (ssd only)        [4]\n"
     "  --alpha        <float>  Acceptance rate (sd/ssd only)                 [0.9]\n"
@@ -178,13 +179,17 @@ int main(int argc, char** argv) {
   }
 
   // Validate mode
-  if (mode != "ar" && mode != "sd" && mode != "ssd") {
-    fprintf(stderr, "Error: --mode must be one of: ar, sd, ssd (got '%s')\n", mode.c_str());
+  if (mode != "ar" && mode != "sd" && mode != "ssd" && mode != "ssd-single") {
+    fprintf(stderr, "Error: --mode must be one of: ar, sd, ssd, ssd-single (got '%s')\n", mode.c_str());
     return 1;
   }
   // Validate tp
   if (tp < 1) {
     fprintf(stderr, "Error: --tp must be >= 1\n");
+    return 1;
+  }
+  if (mode == "ssd-single" && tp != 1) {
+    fprintf(stderr, "Error: mode 'ssd-single' requires --tp 1\n");
     return 1;
   }
 
@@ -213,6 +218,9 @@ int main(int argc, char** argv) {
   else if (mode == "ssd")
     run_ssd_benchmark(target_model, draft_model, tp, K, F, N, alpha, phit,
                       warmup, iters, opts);
+  else if (mode == "ssd-single")
+    run_ssd_single_benchmark(target_model, draft_model, K, F, N, alpha, phit,
+                             warmup, iters, opts);
 
   return 0;
 }
