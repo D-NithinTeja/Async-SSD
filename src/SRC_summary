@@ -1,0 +1,3343 @@
+Ingestion Results for /home/nithin/projects/15-418-project/src
+Summary
+Directory: src
+Files analyzed: 20
+
+Estimated tokens: 25.7k
+
+
+Directory structure:
+└── src/
+    ├── bench_ar.cu
+    ├── bench_ar.h
+    ├── bench_common.cu
+    ├── bench_common.h
+    ├── bench_sd.cu
+    ├── bench_sd.h
+    ├── bench_ssd_single.cu
+    ├── bench_ssd_single.h
+    ├── bench_ssd.cu
+    ├── bench_ssd.h
+    ├── check.h
+    ├── config.h
+    ├── forward_single.cu
+    ├── forward_single.h
+    ├── forward_tp.cu
+    ├── forward_tp.h
+    ├── gemm.h
+    ├── gpu_context.h
+    ├── main.cu
+    └── thread_safe_queue.h
+
+
+File Contents
+
+===============================================
+File: bench_ar.cu
+===============================================
+
+// bench_ar.cu
+// AR decode benchmark implementations.
+
+#include <cstdio>
+#include <vector>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+
+#include "check.h"
+#include "config.h"
+#include "gpu_context.h"
+#include "forward_single.h"
+#include "bench_common.h"
+
+#ifdef USE_NCCL
+#include <thread>
+#include <nccl.h>
+#include "forward_tp.h"
+#endif
+
+
+// ---------------------------------------------------------------------------
+// Single-GPU
+// ---------------------------------------------------------------------------
+
+// Time `bench_iters` AR-decode runs of N_tokens forward passes (each at M=1).
+// Returns ms per outer iter (i.e. per N-token decode).
+static float bench_ar_decode_single(
+  const ModelConfig& cfg,
+  int N_tokens,
+  int warmup_iters,
+  int bench_iters
+) {
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  int L = cfg.n_layers;
+  std::vector<LayerWeights> all_weights(L);
+  for (int l = 0; l < L; l++)
+    alloc_layer_weights(all_weights[l], cfg);
+
+  ActivationBuffers buf = alloc_activations(cfg, 1);
+
+  for (int i = 0; i < warmup_iters; i++)
+    forward_model(handle, cfg, all_weights.data(), 1,
+                  buf.x, buf.scratch1, buf.scratch2);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  cudaEvent_t start, stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  CHECK_CUDA(cudaEventRecord(start));
+  for (int i = 0; i < bench_iters; i++)
+    for (int t = 0; t < N_tokens; t++)
+      forward_model(handle, cfg, all_weights.data(), 1,
+                    buf.x, buf.scratch1, buf.scratch2);
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
+
+  float total_ms = 0;
+  CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+  free_activations(buf);
+  for (int l = 0; l < L; l++)
+    free_layer_weights(all_weights[l]);
+  CHECK_CUBLAS(cublasDestroy(handle));
+
+  return total_ms / bench_iters;
+}
+
+// Per-layer fallback for models that don't fit on one GPU. Returns ms per
+// single forward pass at M=1 (extrapolated to n_layers).
+static float bench_step_layer_single(
+  const ModelConfig& cfg,
+  int warmup_iters,
+  int bench_iters
+) {
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  LayerWeights weights;
+  alloc_layer_weights(weights, cfg);
+  ActivationBuffers buf = alloc_activations(cfg, 1);
+
+  for (int i = 0; i < warmup_iters; i++)
+    forward_layer(handle, cfg, weights, 1,
+                  buf.x, buf.scratch1, buf.scratch2);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  cudaEvent_t start, stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  CHECK_CUDA(cudaEventRecord(start));
+  for (int i = 0; i < bench_iters; i++)
+    forward_layer(handle, cfg, weights, 1,
+                  buf.x, buf.scratch1, buf.scratch2);
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
+
+  float total_ms = 0;
+  CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+  free_activations(buf);
+  free_layer_weights(weights);
+  CHECK_CUBLAS(cublasDestroy(handle));
+
+  return (total_ms / bench_iters) * cfg.n_layers;
+}
+
+
+// ---------------------------------------------------------------------------
+// TP
+// ---------------------------------------------------------------------------
+
+#ifdef USE_NCCL
+
+static float bench_ar_decode_tp(
+  const ModelConfig& cfg,
+  int T,
+  int N_tokens,
+  int warmup_iters,
+  int bench_iters
+) {
+  ncclUniqueId id;
+  CHECK_NCCL(ncclGetUniqueId(&id));
+
+  std::vector<float> results(T);
+  std::vector<std::thread> threads;
+
+  for (int r = 0; r < T; r++) {
+    threads.emplace_back([&, r]() {
+      GPUContext ctx = init_gpu(r, T, id);
+
+      int L = cfg.n_layers;
+      std::vector<TPLayerWeights> all_weights(L);
+      for (int l = 0; l < L; l++)
+        alloc_tp_layer_weights(all_weights[l], cfg, T);
+
+      ActivationBuffers buf = alloc_activations_tp(cfg, 1, T);
+
+      for (int i = 0; i < warmup_iters; i++)
+        forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                         cfg, all_weights.data(), T, 1,
+                         buf.x, buf.scratch1, buf.scratch2);
+      CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+
+      cudaEvent_t start, stop;
+      CHECK_CUDA(cudaEventCreate(&start));
+      CHECK_CUDA(cudaEventCreate(&stop));
+
+      CHECK_CUDA(cudaEventRecord(start, ctx.stream));
+      for (int i = 0; i < bench_iters; i++)
+        for (int t = 0; t < N_tokens; t++)
+          forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                           cfg, all_weights.data(), T, 1,
+                           buf.x, buf.scratch1, buf.scratch2);
+      CHECK_CUDA(cudaEventRecord(stop, ctx.stream));
+      CHECK_CUDA(cudaEventSynchronize(stop));
+
+      float total_ms = 0;
+      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+      results[r] = total_ms / bench_iters;
+
+      CHECK_CUDA(cudaEventDestroy(start));
+      CHECK_CUDA(cudaEventDestroy(stop));
+      free_activations(buf);
+      for (int l = 0; l < L; l++)
+        free_tp_layer_weights(all_weights[l]);
+      destroy_gpu(ctx);
+    });
+  }
+
+  for (auto& t : threads) t.join();
+  return results[0];
+}
+
+static float bench_step_layer_tp(
+  const ModelConfig& cfg,
+  int T,
+  int warmup_iters,
+  int bench_iters
+) {
+  ncclUniqueId id;
+  CHECK_NCCL(ncclGetUniqueId(&id));
+
+  std::vector<float> results(T);
+  std::vector<std::thread> threads;
+
+  for (int r = 0; r < T; r++) {
+    threads.emplace_back([&, r]() {
+      GPUContext ctx = init_gpu(r, T, id);
+
+      TPLayerWeights weights;
+      alloc_tp_layer_weights(weights, cfg, T);
+      ActivationBuffers buf = alloc_activations_tp(cfg, 1, T);
+
+      for (int i = 0; i < warmup_iters; i++)
+        forward_layer_tp(ctx.handle, ctx.comm, ctx.stream,
+                         cfg, weights, T, 1,
+                         buf.x, buf.scratch1, buf.scratch2);
+      CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+
+      cudaEvent_t start, stop;
+      CHECK_CUDA(cudaEventCreate(&start));
+      CHECK_CUDA(cudaEventCreate(&stop));
+
+      CHECK_CUDA(cudaEventRecord(start, ctx.stream));
+      for (int i = 0; i < bench_iters; i++)
+        forward_layer_tp(ctx.handle, ctx.comm, ctx.stream,
+                         cfg, weights, T, 1,
+                         buf.x, buf.scratch1, buf.scratch2);
+      CHECK_CUDA(cudaEventRecord(stop, ctx.stream));
+      CHECK_CUDA(cudaEventSynchronize(stop));
+
+      float total_ms = 0;
+      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+      results[r] = (total_ms / bench_iters) * cfg.n_layers;
+
+      CHECK_CUDA(cudaEventDestroy(start));
+      CHECK_CUDA(cudaEventDestroy(stop));
+      free_activations(buf);
+      free_tp_layer_weights(weights);
+      destroy_gpu(ctx);
+    });
+  }
+
+  for (auto& t : threads) t.join();
+  return results[0];
+}
+
+#endif // USE_NCCL
+
+
+// ---------------------------------------------------------------------------
+// Dispatch helpers
+// ---------------------------------------------------------------------------
+
+// One forward pass at M=1: ms.
+static float measure_step_ms(
+  const ModelConfig& cfg,
+  int tp,
+  int warmup_iters,
+  int bench_iters,
+  bool fits
+) {
+  if (fits) {
+    if (tp == 1)
+      return bench_ar_decode_single(cfg, 1, warmup_iters, bench_iters);
+    #ifdef USE_NCCL
+      return bench_ar_decode_tp(cfg, tp, 1, warmup_iters, bench_iters);
+    #else
+      fprintf(stderr, "Error: TP>1 requires building with USE_NCCL=1\n");
+      exit(1);
+    #endif
+  } else {
+    if (tp == 1)
+      return bench_step_layer_single(cfg, warmup_iters, bench_iters * 5);
+    #ifdef USE_NCCL
+      return bench_step_layer_tp(cfg, tp, warmup_iters, bench_iters * 5);
+    #else
+      fprintf(stderr, "Error: TP>1 requires building with USE_NCCL=1\n");
+      exit(1);
+    #endif
+  }
+}
+
+// Full N-token decode
+static float measure_e2e_ms(
+  const ModelConfig& cfg,
+  int tp,
+  int N_tokens,
+  int warmup_iters,
+  int bench_iters,
+  bool fits
+) {
+  if (fits) {
+    if (tp == 1)
+      return bench_ar_decode_single(cfg, N_tokens, warmup_iters, bench_iters);
+    #ifdef USE_NCCL
+      return bench_ar_decode_tp(cfg, tp, N_tokens, warmup_iters, bench_iters);
+    #else
+      fprintf(stderr, "Error: TP>1 requires building with USE_NCCL=1\n");
+      exit(1);
+    #endif
+  } else {
+    // step_ms is one full forward pass; extrapolate to N tokens.
+    float step_ms = measure_step_ms(cfg, tp, warmup_iters, bench_iters, fits);
+    return step_ms * N_tokens;
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+void run_ar_benchmark(
+  const ModelConfig& cfg,
+  int tp,
+  int N_tokens,
+  int warmup_iters,
+  int bench_iters,
+  const BenchOpts& opts
+) {
+  bool fits = model_fits(cfg, tp);
+
+  BenchInfo info;
+  info.mode = "ar";
+  info.target = &cfg;
+  info.tp = tp;
+  info.N = N_tokens;
+  info.warmup = warmup_iters;
+  info.iters = bench_iters;
+  info.target_fits = fits;
+
+  print_bench_header(info);
+
+  ComponentTimes ct;
+  if (!opts.skip_component) {
+    ct.target_step_ms = measure_step_ms(cfg, tp, warmup_iters, bench_iters, fits);
+  }
+  print_components(info, ct);
+
+  BenchResult br;
+  if (!opts.skip_e2e) {
+    float e2e_ms = measure_e2e_ms(cfg, tp, N_tokens,
+                                  warmup_iters, bench_iters, fits);
+    br.e2e_ms          = e2e_ms;
+    br.avg_tokens      = static_cast<float>(N_tokens);
+    br.avg_rounds      = static_cast<float>(N_tokens);  // 1 token per round
+    br.throughput_tok_s = e2e_ms > 0 ? N_tokens * 1000.0f / e2e_ms : 0.0f;
+  }
+  print_result(info, br);
+
+  if (opts.csv) print_csv_row(info, ct, br);
+}
+
+
+===============================================
+File: bench_ar.h
+===============================================
+
+// bench_ar.h
+// AR decode benchmark: single-GPU and tensor-parallel.
+
+#pragma once
+
+#include "bench_common.h"
+#include "config.h"
+
+// Run the AR decode benchmark for a given model and TP degree.
+// Generates N_tokens tokens with M=1 per step.
+//
+// Behavior is controlled by `opts`:
+//   - opts.skip_component: skip the per-step (M=1) timing pass.
+//   - opts.skip_e2e:       skip the N-token decode pass (component only).
+//   - opts.csv:            also emit one CSV row at the end (prefixed RESULT,).
+void run_ar_benchmark(
+  const ModelConfig& cfg,
+  int tp,
+  int N_tokens,
+  int warmup_iters,
+  int bench_iters,
+  const BenchOpts& opts
+);
+
+
+===============================================
+File: bench_common.cu
+===============================================
+
+// bench_common.cu
+// Implementations of the uniform print and CSV helpers declared in
+// bench_common.h.
+
+#include <cstdio>
+#include "bench_common.h"
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static const char* fits_str(bool fits) {
+  return fits ? "YES" : "NO (layer estimate)";
+}
+
+static double gb(size_t bytes) {
+  return bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+static bool is_ssd_mode(const std::string& mode) {
+  return mode == "ssd" || mode == "ssd-single";
+}
+
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
+
+void print_bench_header(const BenchInfo& info) {
+  const ModelConfig& t = *info.target;
+  printf("--- %s Benchmark ---\n",
+         info.mode == "ar"  ? "AR" :
+         info.mode == "sd"  ? "SD" :
+         info.mode == "ssd" ? "SSD" :
+         info.mode == "ssd-single" ? "SSD Single-GPU" : info.mode.c_str());
+  printf("  Target: %s (d=%d, L=%d)\n", t.name.c_str(), t.d_model, t.n_layers);
+  if (info.draft) {
+    const ModelConfig& d = *info.draft;
+    printf("  Draft:  %s (d=%d, L=%d)\n",
+           d.name.c_str(), d.d_model, d.n_layers);
+  }
+
+  // Config echo
+  if (info.mode == "ar") {
+    printf("  TP=%d, N=%d\n", info.tp, info.N);
+  } else if (info.mode == "sd") {
+    printf("  TP=%d, K=%d, alpha=%.2f, N=%d\n",
+           info.tp, info.K, info.alpha, info.N);
+  } else if (info.mode == "ssd") {
+    printf("  TP=%d (+1 draft GPU), K=%d, F=%d, alpha=%.2f, phit=%.2f, N=%d\n",
+           info.tp, info.K, info.F, info.alpha, info.phit, info.N);
+  } else if (info.mode == "ssd-single") {
+    printf("  One GPU, two worker threads, K=%d, F=%d, alpha=%.2f, phit=%.2f, N=%d\n",
+           info.K, info.F, info.alpha, info.phit, info.N);
+  }
+
+  // Fit info
+  size_t target_bytes = (info.tp == 1)
+    ? t.total_weight_bytes()
+    : t.total_tp_weight_bytes(info.tp);
+  printf("  Target weight footprint%s: %.2f GB | Fits: %s\n",
+         info.tp > 1 ? " (per GPU)" : "",
+         gb(target_bytes), fits_str(info.target_fits));
+  if (info.draft) {
+    printf("  Draft weight footprint:       %.2f GB | Fits: %s\n",
+           gb(info.draft->total_weight_bytes()),
+           fits_str(info.draft_fits));
+  }
+  printf("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
+
+void print_components(const BenchInfo& info, const ComponentTimes& ct) {
+  // If everything is zero the caller skipped this block.
+  if (ct.target_step_ms == 0.0f && ct.target_verify_ms == 0.0f &&
+      ct.draft_step_ms  == 0.0f && ct.draft_total_ms   == 0.0f &&
+      ct.prespec_ms     == 0.0f) {
+    return;
+  }
+
+  printf("  [Component Timing]\n");
+  if (ct.target_step_ms > 0.0f)
+    printf("    Target step  (M=1):       %.3f ms\n", ct.target_step_ms);
+  if (ct.target_verify_ms > 0.0f)
+    printf("    Target verify(M=%d):       %.3f ms\n",
+           info.K, ct.target_verify_ms);
+  if (ct.draft_step_ms > 0.0f)
+    printf("    Draft step   (M=1):       %.3f ms\n", ct.draft_step_ms);
+  if (ct.draft_total_ms > 0.0f)
+    printf("    Draft total  (K=%d, M=1):  %.3f ms\n",
+           info.K, ct.draft_total_ms);
+  if (ct.prespec_ms > 0.0f)
+    printf("    Pre-spec     (K=%d, M=%d): %.3f ms\n",
+           info.K, info.F, ct.prespec_ms);
+  printf("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Result
+// ---------------------------------------------------------------------------
+
+void print_result(const BenchInfo& info, const BenchResult& br) {
+  if (br.e2e_ms == 0.0f) return;
+
+  printf("  [End-to-End]\n");
+  printf("    Avg tokens:   %.1f\n", br.avg_tokens);
+  printf("    Avg rounds:   %.1f\n", br.avg_rounds);
+  if (br.avg_rounds > 0.0f)
+    printf("    Tokens/round: %.2f\n", br.avg_tokens / br.avg_rounds);
+  if (is_ssd_mode(info.mode))
+    printf("    Miss rate:    %.2f  (expected 1 - phit = %.2f)\n",
+           br.miss_rate, 1.0f - info.phit);
+  printf("    E2E time:     %.2f ms\n", br.e2e_ms);
+  printf("    Throughput:   %.1f tok/s\n\n", br.throughput_tok_s);
+}
+
+// ---------------------------------------------------------------------------
+// CSV
+// ---------------------------------------------------------------------------
+
+// Schema:
+//   tag, mode, target, draft, tp, K, F, N, alpha, phit,
+//   target_fits, draft_fits,
+//   target_step_ms, target_verify_ms, draft_step_ms, draft_total_ms, prespec_ms,
+//   e2e_ms, avg_tokens, avg_rounds, miss_rate, throughput_tok_s
+//
+// target_fits / draft_fits are 0/1 flags. When 0, the timing columns for
+// that model are layer-extrapolated (one layer's forward pass scaled to
+// n_layers) rather than a true full-model measurement.
+void print_csv_header() {
+  printf("tag,mode,target,draft,tp,K,F,N,alpha,phit,"
+         "target_fits,draft_fits,"
+         "target_step_ms,target_verify_ms,draft_step_ms,draft_total_ms,prespec_ms,"
+         "e2e_ms,avg_tokens,avg_rounds,miss_rate,throughput_tok_s\n");
+}
+
+void print_csv_row(const BenchInfo& info,
+                   const ComponentTimes& ct,
+                   const BenchResult& br) {
+  const char* target_name = info.target ? info.target->name.c_str() : "";
+  const char* draft_name  = info.draft  ? info.draft->name.c_str()  : "";
+  printf(
+    "RESULT,%s,%s,%s,%d,%d,%d,%d,%.4f,%.4f,"
+    "%d,%d,"
+    "%.4f,%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f,%.4f\n",
+    info.mode.c_str(), target_name, draft_name,
+    info.tp, info.K, info.F, info.N, info.alpha, info.phit,
+    info.target_fits ? 1 : 0, info.draft_fits ? 1 : 0,
+    ct.target_step_ms, ct.target_verify_ms,
+    ct.draft_step_ms, ct.draft_total_ms, ct.prespec_ms,
+    br.e2e_ms, br.avg_tokens, br.avg_rounds,
+    br.miss_rate, br.throughput_tok_s
+  );
+}
+
+
+===============================================
+File: bench_common.h
+===============================================
+
+// bench_common.h
+// Shared types and printing helpers for all benchmark modes.
+//
+// Every mode (ar/sd/ssd) populates the same two result structs:
+//   - ComponentTimes: per-stage forward-pass measurements
+//   - BenchResult:    end-to-end measurement
+// Fields that don't apply to a given mode are left at 0.
+//
+// Printing goes through a single set of functions so all modes produce
+// identical layouts and the CSV output schema is shared.
+
+#pragma once
+
+#include <string>
+#include "config.h"
+
+// ---------------------------------------------------------------------------
+// CLI-level options that affect what work the benchmark does and how it
+// prints.
+// ---------------------------------------------------------------------------
+struct BenchOpts {
+  bool csv            = false;  // emit one CSV row at the end
+  bool skip_component = false;  // skip per-stage forward-pass timings
+  bool skip_e2e       = false;  // skip the end-to-end simulation
+};
+
+// ---------------------------------------------------------------------------
+// Run configuration captured for printing/CSV. Mode-irrelevant fields are
+// left at their defaults (e.g. AR has no draft, K, F, alpha, phit).
+// ---------------------------------------------------------------------------
+struct BenchInfo {
+  std::string mode; 
+  const ModelConfig* target = nullptr;
+  const ModelConfig* draft  = nullptr;
+  int   tp     = 1;
+  int   K      = 0;
+  int   F      = 0;
+  int   N      = 0;
+  float alpha  = 0.0f;
+  float phit   = 0.0f;
+  int   warmup = 0;
+  int   iters  = 0;
+  bool  target_fits = true;
+  bool  draft_fits  = true;
+};
+
+// ---------------------------------------------------------------------------
+// Per-stage forward-pass timings (ms). All fields default to 0 for stages
+// that don't apply to the current mode.
+// ---------------------------------------------------------------------------
+struct ComponentTimes {
+  float target_step_ms   = 0.0f;  // one target forward at M=1
+  float target_verify_ms = 0.0f;  // one target forward at M=K   (sd/ssd)
+  float draft_step_ms    = 0.0f;  // one draft  forward at M=1   (sd/ssd)
+  float draft_total_ms   = 0.0f;  // K * draft_step_ms           (sd/ssd)
+  float prespec_ms       = 0.0f;  // K * draft forward at M=F    (ssd)
+};
+
+// ---------------------------------------------------------------------------
+// End-to-end measurement.
+//   avg_rounds is 1 for AR (one token per "round"), >=1 for SD/SSD.
+//   miss_rate is 0 for AR/SD, in [0,1] for SSD.
+// ---------------------------------------------------------------------------
+struct BenchResult {
+  float e2e_ms           = 0.0f;  // wall-clock per outer iter
+  float avg_tokens       = 0.0f;  // tokens generated per iter
+  float avg_rounds       = 0.0f;  // rounds per iter
+  float throughput_tok_s = 0.0f;
+  float miss_rate        = 0.0f;
+};
+
+// ---------------------------------------------------------------------------
+// Printing
+// ---------------------------------------------------------------------------
+
+// Mode header + model info + fit summary.
+void print_bench_header(const BenchInfo& info);
+
+// Per-stage forward-pass timings. Skips the block entirely if all fields
+// are zero (i.e. component timing was skipped).
+void print_components(const BenchInfo& info, const ComponentTimes& ct);
+
+// End-to-end summary. Skips the block if e2e_ms == 0.
+void print_result(const BenchInfo& info, const BenchResult& br);
+
+// ---------------------------------------------------------------------------
+// CSV output
+// ---------------------------------------------------------------------------
+
+// Print just the CSV header line and exit. Useful for driver scripts:
+//   ./benchmark --csv-header > results.csv
+//   for ... ; do ./benchmark ... --csv | grep '^RESULT,' >> results.csv ; done
+void print_csv_header();
+
+// Print one CSV data row prefixed with "RESULT," so it can be grepped out
+// of mixed human-readable output.
+void print_csv_row(const BenchInfo& info,
+                   const ComponentTimes& ct,
+                   const BenchResult& br);
+
+
+===============================================
+File: bench_sd.cu
+===============================================
+
+// bench_sd.cu
+// SD benchmark implementations.
+
+#include <cstdio>
+#include <cmath>
+#include <vector>
+#include <random>
+#include <algorithm>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+
+#include "check.h"
+#include "config.h"
+#include "gpu_context.h"
+#include "forward_single.h"
+#include "bench_common.h"
+
+#ifdef USE_NCCL
+#include <thread>
+#include <pthread.h>
+#include <atomic>
+#include <nccl.h>
+#include "forward_tp.h"
+#endif
+
+
+// ---------------------------------------------------------------------------
+// Single-GPU
+// ---------------------------------------------------------------------------
+
+// Returns ms for K back-to-back draft forward passes at M=1
+static float bench_draft_total_single(
+  const ModelConfig& draft_cfg,
+  int K,
+  int warmup_iters,
+  int bench_iters,
+  bool fits
+) {
+  cudaSetDevice(0);
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  if (fits) {
+    int L = draft_cfg.n_layers;
+    std::vector<LayerWeights> weights(L);
+    for (int l = 0; l < L; l++)
+      alloc_layer_weights(weights[l], draft_cfg);
+    ActivationBuffers buf = alloc_activations(draft_cfg, 1);
+
+    for (int i = 0; i < warmup_iters; i++)
+      for (int k = 0; k < K; k++)
+        forward_model(handle, draft_cfg, weights.data(), 1,
+                      buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < bench_iters; i++)
+      for (int k = 0; k < K; k++)
+        forward_model(handle, draft_cfg, weights.data(), 1,
+                      buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float total_ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    free_activations(buf);
+    for (int l = 0; l < L; l++)
+      free_layer_weights(weights[l]);
+    CHECK_CUBLAS(cublasDestroy(handle));
+    return total_ms / bench_iters;
+  } else {
+    LayerWeights weights;
+    alloc_layer_weights(weights, draft_cfg);
+    ActivationBuffers buf = alloc_activations(draft_cfg, 1);
+
+    for (int i = 0; i < warmup_iters; i++)
+      forward_layer(handle, draft_cfg, weights, 1,
+                    buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    int layer_iters = bench_iters * 5;
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < layer_iters; i++)
+      forward_layer(handle, draft_cfg, weights, 1,
+                    buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float total_ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    float layer_ms = total_ms / layer_iters;
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    free_activations(buf);
+    free_layer_weights(weights);
+    CHECK_CUBLAS(cublasDestroy(handle));
+    return layer_ms * draft_cfg.n_layers * K;
+  }
+}
+
+// Returns ms for one target forward pass at M tokens
+static float bench_target_pass_single(
+  const ModelConfig& target_cfg,
+  int M,
+  int warmup_iters,
+  int bench_iters,
+  bool fits
+) {
+  cudaSetDevice(0);
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  if (fits) {
+    int L = target_cfg.n_layers;
+    std::vector<LayerWeights> weights(L);
+    for (int l = 0; l < L; l++)
+      alloc_layer_weights(weights[l], target_cfg);
+    ActivationBuffers buf = alloc_activations(target_cfg, M);
+
+    for (int i = 0; i < warmup_iters; i++)
+      forward_model(handle, target_cfg, weights.data(), M,
+                    buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < bench_iters; i++)
+      forward_model(handle, target_cfg, weights.data(), M,
+                    buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float total_ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    free_activations(buf);
+    for (int l = 0; l < L; l++)
+      free_layer_weights(weights[l]);
+    CHECK_CUBLAS(cublasDestroy(handle));
+    return total_ms / bench_iters;
+  } else {
+    LayerWeights weights;
+    alloc_layer_weights(weights, target_cfg);
+    ActivationBuffers buf = alloc_activations(target_cfg, M);
+
+    for (int i = 0; i < warmup_iters; i++)
+      forward_layer(handle, target_cfg, weights, M,
+                    buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    int layer_iters = bench_iters * 5;
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < layer_iters; i++)
+      forward_layer(handle, target_cfg, weights, M,
+                    buf.x, buf.scratch1, buf.scratch2);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float total_ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    float layer_ms = total_ms / layer_iters;
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    free_activations(buf);
+    free_layer_weights(weights);
+    CHECK_CUBLAS(cublasDestroy(handle));
+    return layer_ms * target_cfg.n_layers;
+  }
+}
+
+// Single-GPU SD end-to-end. Returns BenchResult populated.
+static BenchResult bench_sd_e2e_single(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int K,
+  int N,
+  float alpha,
+  int warmup_iters,
+  int bench_iters
+) {
+  cudaSetDevice(0);
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  int tL = target_cfg.n_layers;
+  int dL = draft_cfg.n_layers;
+
+  std::vector<LayerWeights> target_w(tL);
+  for (int l = 0; l < tL; l++)
+    alloc_layer_weights(target_w[l], target_cfg);
+  ActivationBuffers target_buf = alloc_activations(target_cfg, K);
+
+  std::vector<LayerWeights> draft_w(dL);
+  for (int l = 0; l < dL; l++)
+    alloc_layer_weights(draft_w[l], draft_cfg);
+  ActivationBuffers draft_buf = alloc_activations(draft_cfg, 1);
+
+  std::mt19937 rng(42);
+  std::bernoulli_distribution accept_dist(alpha);
+
+  for (int i = 0; i < warmup_iters; i++) {
+    for (int k = 0; k < K; k++)
+      forward_model(handle, draft_cfg, draft_w.data(), 1,
+                    draft_buf.x, draft_buf.scratch1, draft_buf.scratch2);
+    forward_model(handle, target_cfg, target_w.data(), K,
+                  target_buf.x, target_buf.scratch1, target_buf.scratch2);
+  }
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  cudaEvent_t start, stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  int total_tokens = 0;
+  int total_rounds = 0;
+
+  CHECK_CUDA(cudaEventRecord(start));
+  for (int i = 0; i < bench_iters; i++) {
+    int tokens = 0;
+    while (tokens < N) {
+      for (int k = 0; k < K; k++)
+        forward_model(handle, draft_cfg, draft_w.data(), 1,
+                      draft_buf.x, draft_buf.scratch1, draft_buf.scratch2);
+      forward_model(handle, target_cfg, target_w.data(), K,
+                    target_buf.x, target_buf.scratch1, target_buf.scratch2);
+
+      int accepted = 0;
+      for (int k = 0; k < K; k++) {
+        if (accept_dist(rng))
+          accepted++;
+        else
+          break;
+      }
+      tokens += accepted + 1;
+      total_rounds++;
+    }
+    total_tokens += tokens;
+  }
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
+
+  float total_ms = 0;
+  CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+
+  free_activations(draft_buf);
+  for (int l = 0; l < dL; l++)
+    free_layer_weights(draft_w[l]);
+  free_activations(target_buf);
+  for (int l = 0; l < tL; l++)
+    free_layer_weights(target_w[l]);
+  CHECK_CUBLAS(cublasDestroy(handle));
+
+  BenchResult br;
+  br.e2e_ms           = total_ms / bench_iters;
+  br.avg_tokens       = static_cast<float>(total_tokens) / bench_iters;
+  br.avg_rounds       = static_cast<float>(total_rounds) / bench_iters;
+  br.throughput_tok_s = br.e2e_ms > 0 ? br.avg_tokens * 1000.0f / br.e2e_ms : 0.0f;
+  return br;
+}
+
+
+// ---------------------------------------------------------------------------
+// TP
+// ---------------------------------------------------------------------------
+
+#ifdef USE_NCCL
+
+// Returns ms for one target forward pass at M tokens (TP-sharded)
+static float bench_target_pass_tp(
+  const ModelConfig& target_cfg,
+  int T,
+  int M,
+  int warmup_iters,
+  int bench_iters,
+  bool fits
+) {
+  ncclUniqueId id;
+  CHECK_NCCL(ncclGetUniqueId(&id));
+
+  std::vector<float> results(T);
+  std::vector<std::thread> threads;
+
+  if (fits) {
+    for (int r = 0; r < T; r++) {
+      threads.emplace_back([&, r]() {
+        GPUContext ctx = init_gpu(r, T, id);
+
+        int L = target_cfg.n_layers;
+        std::vector<TPLayerWeights> weights(L);
+        for (int l = 0; l < L; l++)
+          alloc_tp_layer_weights(weights[l], target_cfg, T);
+        ActivationBuffers buf = alloc_activations_tp(target_cfg, M, T);
+
+        for (int i = 0; i < warmup_iters; i++)
+          forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                           target_cfg, weights.data(), T, M,
+                           buf.x, buf.scratch1, buf.scratch2);
+        CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+
+        cudaEvent_t start, stop;
+        CHECK_CUDA(cudaEventCreate(&start));
+        CHECK_CUDA(cudaEventCreate(&stop));
+
+        CHECK_CUDA(cudaEventRecord(start, ctx.stream));
+        for (int i = 0; i < bench_iters; i++)
+          forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                           target_cfg, weights.data(), T, M,
+                           buf.x, buf.scratch1, buf.scratch2);
+        CHECK_CUDA(cudaEventRecord(stop, ctx.stream));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+
+        float total_ms = 0;
+        CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+        results[r] = total_ms / bench_iters;
+
+        CHECK_CUDA(cudaEventDestroy(start));
+        CHECK_CUDA(cudaEventDestroy(stop));
+        free_activations(buf);
+        for (int l = 0; l < L; l++)
+          free_tp_layer_weights(weights[l]);
+        destroy_gpu(ctx);
+      });
+    }
+  } else {
+    for (int r = 0; r < T; r++) {
+      threads.emplace_back([&, r]() {
+        GPUContext ctx = init_gpu(r, T, id);
+
+        TPLayerWeights weights;
+        alloc_tp_layer_weights(weights, target_cfg, T);
+        ActivationBuffers buf = alloc_activations_tp(target_cfg, M, T);
+
+        for (int i = 0; i < warmup_iters; i++)
+          forward_layer_tp(ctx.handle, ctx.comm, ctx.stream,
+                           target_cfg, weights, T, M,
+                           buf.x, buf.scratch1, buf.scratch2);
+        CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+
+        int layer_iters = bench_iters * 5;
+        cudaEvent_t start, stop;
+        CHECK_CUDA(cudaEventCreate(&start));
+        CHECK_CUDA(cudaEventCreate(&stop));
+
+        CHECK_CUDA(cudaEventRecord(start, ctx.stream));
+        for (int i = 0; i < layer_iters; i++)
+          forward_layer_tp(ctx.handle, ctx.comm, ctx.stream,
+                           target_cfg, weights, T, M,
+                           buf.x, buf.scratch1, buf.scratch2);
+        CHECK_CUDA(cudaEventRecord(stop, ctx.stream));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+
+        float total_ms = 0;
+        CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+        results[r] = (total_ms / layer_iters) * target_cfg.n_layers;
+
+        CHECK_CUDA(cudaEventDestroy(start));
+        CHECK_CUDA(cudaEventDestroy(stop));
+        free_activations(buf);
+        free_tp_layer_weights(weights);
+        destroy_gpu(ctx);
+      });
+    }
+  }
+
+  for (auto& t : threads) t.join();
+  return results[0];
+}
+
+// TP SD end-to-end. Target shards across T GPUs, draft runs on rank 0.
+static BenchResult bench_sd_e2e_tp(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int T,
+  int K,
+  int N,
+  float alpha,
+  int warmup_iters,
+  int bench_iters
+) {
+  ncclUniqueId id;
+  CHECK_NCCL(ncclGetUniqueId(&id));
+
+  std::vector<float> results(T);
+  std::vector<std::thread> threads;
+
+  pthread_barrier_t sync;
+  pthread_barrier_init(&sync, nullptr, T);
+  std::atomic<bool> round_done{false};
+
+  // Only rank 0 tracks these
+  int total_tokens = 0;
+  int total_rounds = 0;
+
+  for (int r = 0; r < T; r++) {
+    threads.emplace_back([&, r]() {
+      GPUContext ctx = init_gpu(r, T, id);
+
+      // Target weights (all ranks, TP-sharded)
+      int tL = target_cfg.n_layers;
+      std::vector<TPLayerWeights> target_w(tL);
+      for (int l = 0; l < tL; l++)
+        alloc_tp_layer_weights(target_w[l], target_cfg, T);
+      ActivationBuffers target_buf = alloc_activations_tp(target_cfg, K, T);
+
+      // Draft weights (rank 0 only, single-GPU)
+      std::vector<LayerWeights> draft_w;
+      ActivationBuffers draft_buf = {nullptr, nullptr, nullptr};
+      cublasHandle_t draft_handle = nullptr;
+      cudaStream_t draft_stream = nullptr;
+      if (r == 0) {
+        int dL = draft_cfg.n_layers;
+        draft_w.resize(dL);
+        for (int l = 0; l < dL; l++)
+          alloc_layer_weights(draft_w[l], draft_cfg);
+        draft_buf = alloc_activations(draft_cfg, 1);
+
+        // Separate handle and stream for draft
+        CHECK_CUBLAS(cublasCreate(&draft_handle));
+        CHECK_CUBLAS(cublasSetMathMode(draft_handle, CUBLAS_TENSOR_OP_MATH));
+        CHECK_CUDA(cudaStreamCreate(&draft_stream));
+        CHECK_CUBLAS(cublasSetStream(draft_handle, draft_stream));
+      }
+
+      std::mt19937 rng(42);
+      std::bernoulli_distribution accept_dist(alpha);
+
+      // Warmup
+      for (int i = 0; i < warmup_iters; i++) {
+        if (r == 0) {
+          for (int k = 0; k < K; k++)
+            forward_model(draft_handle, draft_cfg, draft_w.data(), 1,
+                          draft_buf.x, draft_buf.scratch1, draft_buf.scratch2);
+          CHECK_CUDA(cudaStreamSynchronize(draft_stream));
+        }
+        pthread_barrier_wait(&sync);
+        forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                         target_cfg, target_w.data(), T, K,
+                         target_buf.x, target_buf.scratch1, target_buf.scratch2);
+        CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+        pthread_barrier_wait(&sync);
+      }
+
+      cudaEvent_t start, stop;
+      CHECK_CUDA(cudaEventCreate(&start));
+      CHECK_CUDA(cudaEventCreate(&stop));
+
+      CHECK_CUDA(cudaEventRecord(start, ctx.stream));
+      for (int i = 0; i < bench_iters; i++) {
+        int local_tokens = 0;
+        pthread_barrier_wait(&sync);
+        if (r == 0) round_done.store(false);
+        pthread_barrier_wait(&sync);
+
+        while (true) {
+          if (r == 0) {
+            for (int k = 0; k < K; k++)
+              forward_model(draft_handle, draft_cfg, draft_w.data(), 1,
+                            draft_buf.x, draft_buf.scratch1, draft_buf.scratch2);
+            CHECK_CUDA(cudaStreamSynchronize(draft_stream));
+          }
+          pthread_barrier_wait(&sync);
+
+          forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                           target_cfg, target_w.data(), T, K,
+                           target_buf.x, target_buf.scratch1, target_buf.scratch2);
+          CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+          pthread_barrier_wait(&sync);
+
+          if (r == 0) {
+            int accepted = 0;
+            for (int k = 0; k < K; k++) {
+              if (accept_dist(rng))
+                accepted++;
+              else
+                break;
+            }
+            local_tokens += accepted + 1;
+            total_rounds++;
+
+            if (local_tokens >= N) {
+              total_tokens += local_tokens;
+              round_done.store(true);
+            }
+          }
+          pthread_barrier_wait(&sync);
+
+          if (round_done.load()) break;
+        }
+      }
+      CHECK_CUDA(cudaEventRecord(stop, ctx.stream));
+      CHECK_CUDA(cudaEventSynchronize(stop));
+
+      float total_ms = 0;
+      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+      results[r] = total_ms;
+
+      CHECK_CUDA(cudaEventDestroy(start));
+      CHECK_CUDA(cudaEventDestroy(stop));
+      free_activations(target_buf);
+      for (int l = 0; l < tL; l++)
+        free_tp_layer_weights(target_w[l]);
+      if (r == 0) {
+        free_activations(draft_buf);
+        for (int l = 0; l < (int)draft_w.size(); l++)
+          free_layer_weights(draft_w[l]);
+        CHECK_CUBLAS(cublasDestroy(draft_handle));
+        CHECK_CUDA(cudaStreamDestroy(draft_stream));
+      }
+      destroy_gpu(ctx);
+    });
+  }
+
+  for (auto& t : threads) t.join();
+  pthread_barrier_destroy(&sync);
+
+  BenchResult br;
+  br.e2e_ms           = results[0] / bench_iters;
+  br.avg_tokens       = static_cast<float>(total_tokens) / bench_iters;
+  br.avg_rounds       = static_cast<float>(total_rounds) / bench_iters;
+  br.throughput_tok_s = br.e2e_ms > 0 ? br.avg_tokens * 1000.0f / br.e2e_ms : 0.0f;
+  return br;
+}
+
+#endif // USE_NCCL
+
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+void run_sd_benchmark(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int tp,
+  int K,
+  int N,
+  float alpha,
+  int warmup_iters,
+  int bench_iters,
+  const BenchOpts& opts
+) {
+  bool target_fits = model_fits(target_cfg, tp);
+  bool draft_fits = model_fits(draft_cfg, 1);
+
+  BenchInfo info;
+  info.mode = "sd";
+  info.target = &target_cfg;
+  info.draft  = &draft_cfg;
+  info.tp = tp;
+  info.K = K;
+  info.N = N;
+  info.alpha = alpha;
+  info.warmup = warmup_iters;
+  info.iters = bench_iters;
+  info.target_fits = target_fits;
+  info.draft_fits  = draft_fits;
+
+  print_bench_header(info);
+
+  // Component timing
+  ComponentTimes ct;
+  if (!opts.skip_component) {
+    ct.draft_total_ms = bench_draft_total_single(
+      draft_cfg, K, warmup_iters, bench_iters, draft_fits
+    );
+    ct.draft_step_ms = ct.draft_total_ms / K;
+
+    if (tp == 1) {
+      ct.target_step_ms = bench_target_pass_single(
+        target_cfg, 1, warmup_iters, bench_iters, target_fits
+      );
+      ct.target_verify_ms = bench_target_pass_single(
+        target_cfg, K, warmup_iters, bench_iters, target_fits
+      );
+    } else {
+      #ifdef USE_NCCL
+        ct.target_step_ms = bench_target_pass_tp(
+          target_cfg, tp, 1, warmup_iters, bench_iters, target_fits
+        );
+        ct.target_verify_ms = bench_target_pass_tp(
+          target_cfg, tp, K, warmup_iters, bench_iters, target_fits
+        );
+      #else
+        fprintf(stderr, "Error: TP>1 requires building with USE_NCCL=1\n");
+        exit(1);
+      #endif
+    }
+  }
+  print_components(info, ct);
+
+  // End-to-end
+  BenchResult br;
+  if (!opts.skip_e2e) {
+    bool both_fit = target_fits && draft_fits;
+    if (!both_fit) {
+      printf("  [End-to-End] skipped (model does not fit in memory)\n\n");
+    } else if (tp == 1) {
+      br = bench_sd_e2e_single(
+        target_cfg, draft_cfg, K, N, alpha, warmup_iters, bench_iters
+      );
+    } else {
+      #ifdef USE_NCCL
+        br = bench_sd_e2e_tp(
+          target_cfg, draft_cfg, tp, K, N, alpha, warmup_iters, bench_iters
+        );
+      #else
+        fprintf(stderr, "Error: TP>1 requires building with USE_NCCL=1\n");
+        exit(1);
+      #endif
+    }
+  }
+  print_result(info, br);
+
+  if (opts.csv) print_csv_row(info, ct, br);
+}
+
+
+===============================================
+File: bench_sd.h
+===============================================
+
+// bench_sd.h
+// SD benchmark: single-GPU and tensor-parallel.
+
+#pragma once
+
+#include "bench_common.h"
+#include "config.h"
+
+void run_sd_benchmark(
+  const ModelConfig& target_model,
+  const ModelConfig& draft_model,
+  int tp,
+  int K,
+  int N,
+  float alpha,
+  int warmup,
+  int iters,
+  const BenchOpts& opts
+);
+
+
+===============================================
+File: bench_ssd_single.cu
+===============================================
+
+// bench_ssd_single.cu
+// SSD benchmark scheduling on one GPU with blocking host-memory queues.
+
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstdio>
+#include <mutex>
+#include <random>
+#include <thread>
+#include <vector>
+
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include "bench_ssd_single.h"
+#include "check.h"
+#include "forward_single.h"
+#include "gpu_context.h"
+#include "thread_safe_queue.h"
+
+namespace {
+
+struct SpecMessage {
+  std::vector<half> tokens;
+};
+
+struct OutcomeMessage {
+  int accepted;
+  int bonus_id;
+  bool done;
+};
+
+class StartGate {
+ public:
+  void arrive_and_wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (++arrived_ == 2) {
+      open_ = true;
+      cv_.notify_all();
+      return;
+    }
+    cv_.wait(lock, [this] { return open_; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int arrived_ = 0;
+  bool open_ = false;
+};
+
+class CudaStream {
+ public:
+  CudaStream() { CHECK_CUDA(cudaStreamCreate(&stream_)); }
+  ~CudaStream() { cudaStreamDestroy(stream_); }
+
+  cudaStream_t get() const { return stream_; }
+
+ private:
+  cudaStream_t stream_ = nullptr;
+};
+
+class CublasHandle {
+ public:
+  explicit CublasHandle(cudaStream_t stream) {
+    CHECK_CUBLAS(cublasCreate(&handle_));
+    CHECK_CUBLAS(cublasSetMathMode(handle_, CUBLAS_TENSOR_OP_MATH));
+    CHECK_CUBLAS(cublasSetStream(handle_, stream));
+  }
+  ~CublasHandle() { cublasDestroy(handle_); }
+
+  cublasHandle_t get() const { return handle_; }
+
+ private:
+  cublasHandle_t handle_ = nullptr;
+};
+
+class CudaEvent {
+ public:
+  CudaEvent() { CHECK_CUDA(cudaEventCreate(&event_)); }
+  ~CudaEvent() { cudaEventDestroy(event_); }
+
+  void record(cudaStream_t stream) { CHECK_CUDA(cudaEventRecord(event_, stream)); }
+  void synchronize() { CHECK_CUDA(cudaEventSynchronize(event_)); }
+  float elapsed_ms_since(const CudaEvent& start) const {
+    float elapsed_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start.event_, event_));
+    return elapsed_ms;
+  }
+
+ private:
+  cudaEvent_t event_ = nullptr;
+};
+
+class ModelState {
+ public:
+  ModelState(const ModelConfig& cfg, int M) : cfg_(cfg) {
+    weights_.resize(cfg_.n_layers);
+    for (int l = 0; l < cfg_.n_layers; ++l)
+      alloc_layer_weights(weights_[l], cfg_);
+    buffers_ = alloc_activations(cfg_, M);
+  }
+
+  ~ModelState() {
+    free_activations(buffers_);
+    for (auto& weight : weights_)
+      free_layer_weights(weight);
+  }
+
+  void forward(cublasHandle_t handle, int M) {
+    forward_model(handle, cfg_, weights_.data(), M,
+                  buffers_.x, buffers_.scratch1, buffers_.scratch2);
+  }
+
+ private:
+  const ModelConfig& cfg_;
+  std::vector<LayerWeights> weights_;
+  ActivationBuffers buffers_ = {nullptr, nullptr, nullptr};
+};
+
+static void run_draft_steps(
+  ModelState& state,
+  cublasHandle_t handle,
+  int K,
+  int M
+) {
+  for (int k = 0; k < K; ++k)
+    state.forward(handle, M);
+}
+
+static SpecMessage make_spec_message(int K) {
+  // bench_ssd's NCCL payload is intentionally synthetic, but retain the
+  // same K-FP16 transport shape when replacing it with shared memory.
+  return {std::vector<half>(K, __float2half(1.0f))};
+}
+
+static float bench_single_pass(
+  const ModelConfig& cfg,
+  int M,
+  int warmup_iters,
+  int bench_iters
+) {
+  CHECK_CUDA(cudaSetDevice(0));
+  CudaStream stream;
+  CublasHandle handle(stream.get());
+  ModelState state(cfg, M);
+
+  for (int i = 0; i < warmup_iters; ++i)
+    state.forward(handle.get(), M);
+  CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+
+  CudaEvent start;
+  CudaEvent stop;
+  start.record(stream.get());
+  for (int i = 0; i < bench_iters; ++i)
+    state.forward(handle.get(), M);
+  stop.record(stream.get());
+  stop.synchronize();
+  return stop.elapsed_ms_since(start) / bench_iters;
+}
+
+static bool models_fit_together(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg
+) {
+  size_t free_mem = get_free_gpu_memory(0);
+  size_t required = target_cfg.total_weight_bytes() + draft_cfg.total_weight_bytes();
+  return required < static_cast<size_t>(free_mem * 0.85);
+}
+
+static BenchResult bench_ssd_e2e_single(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int K,
+  int F,
+  int N,
+  float alpha,
+  float phit,
+  int warmup_iters,
+  int bench_iters
+) {
+  ThreadSafeQueue<SpecMessage> draft_to_target;
+  ThreadSafeQueue<OutcomeMessage> target_to_draft;
+  StartGate start_gate;
+
+  int total_tokens = 0;
+  int total_rounds = 0;
+  int total_misses = 0;
+  float target_elapsed_ms = 0.0f;
+  const int F_eff = F > 0 ? F : 1;
+
+  std::thread draft_worker([&] {
+    CHECK_CUDA(cudaSetDevice(0));
+    CudaStream stream;
+    CublasHandle handle(stream.get());
+    ModelState fanout_state(draft_cfg, F_eff);
+    ModelState step_state(draft_cfg, 1);
+    CudaEvent draft_ready;
+    std::mt19937 rng(1337);
+    std::bernoulli_distribution hit_dist(phit);
+
+    for (int i = 0; i < warmup_iters; ++i) {
+      run_draft_steps(step_state, handle.get(), K, 1);
+      run_draft_steps(fanout_state, handle.get(), K, F_eff);
+    }
+    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+    start_gate.arrive_and_wait();
+
+    int local_misses = 0;
+    for (int iter = 0; iter < bench_iters; ++iter) {
+      run_draft_steps(step_state, handle.get(), K, 1);
+      draft_ready.record(stream.get());
+      draft_ready.synchronize();
+      draft_to_target.push(make_spec_message(K));
+
+      while (true) {
+        // This work runs while pop() blocks for target verification.
+        run_draft_steps(fanout_state, handle.get(), K, F_eff);
+        draft_ready.record(stream.get());
+
+        OutcomeMessage outcome = target_to_draft.pop();
+        draft_ready.synchronize();
+        if (outcome.done)
+          break;
+
+        if (!hit_dist(rng)) {
+          ++local_misses;
+          run_draft_steps(step_state, handle.get(), K, 1);
+          draft_ready.record(stream.get());
+          draft_ready.synchronize();
+        }
+        draft_to_target.push(make_spec_message(K));
+      }
+    }
+    total_misses = local_misses;
+  });
+
+  std::thread target_worker([&] {
+    CHECK_CUDA(cudaSetDevice(0));
+    CudaStream stream;
+    CublasHandle handle(stream.get());
+    ModelState target_state(target_cfg, K);
+    CudaEvent verify_done;
+    std::mt19937 rng(42);
+    std::bernoulli_distribution accept_dist(alpha);
+
+    for (int i = 0; i < warmup_iters; ++i)
+      target_state.forward(handle.get(), K);
+    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+    start_gate.arrive_and_wait();
+
+    const auto start = std::chrono::steady_clock::now();
+    int local_tokens_total = 0;
+    int local_rounds_total = 0;
+    for (int iter = 0; iter < bench_iters; ++iter) {
+      int local_tokens = 0;
+      while (true) {
+        SpecMessage spec = draft_to_target.pop();
+        (void)spec;
+        target_state.forward(handle.get(), K);
+        verify_done.record(stream.get());
+        verify_done.synchronize();
+
+        int accepted = 0;
+        for (int k = 0; k < K; ++k) {
+          if (accept_dist(rng))
+            ++accepted;
+          else
+            break;
+        }
+        local_tokens += accepted + 1;
+        ++local_rounds_total;
+
+        const bool done = local_tokens >= N;
+        target_to_draft.push({accepted, 0, done});
+        if (done) {
+          local_tokens_total += local_tokens;
+          break;
+        }
+      }
+    }
+    const auto stop = std::chrono::steady_clock::now();
+    target_elapsed_ms = std::chrono::duration<float, std::milli>(stop - start).count();
+    total_tokens = local_tokens_total;
+    total_rounds = local_rounds_total;
+  });
+
+  draft_worker.join();
+  target_worker.join();
+
+  BenchResult br;
+  br.e2e_ms = target_elapsed_ms / bench_iters;
+  br.avg_tokens = static_cast<float>(total_tokens) / bench_iters;
+  br.avg_rounds = static_cast<float>(total_rounds) / bench_iters;
+  br.miss_rate = total_rounds > 0
+    ? static_cast<float>(total_misses) / total_rounds
+    : 0.0f;
+  br.throughput_tok_s = br.e2e_ms > 0.0f
+    ? br.avg_tokens * 1000.0f / br.e2e_ms
+    : 0.0f;
+  return br;
+}
+
+}  // namespace
+
+void run_ssd_single_benchmark(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int K,
+  int F,
+  int N,
+  float alpha,
+  float phit,
+  int warmup_iters,
+  int bench_iters,
+  const BenchOpts& opts
+) {
+  const bool target_fits = model_fits(target_cfg, 1);
+  const bool draft_fits = model_fits(draft_cfg, 1);
+
+  BenchInfo info;
+  info.mode = "ssd-single";
+  info.target = &target_cfg;
+  info.draft = &draft_cfg;
+  info.K = K;
+  info.F = F;
+  info.N = N;
+  info.alpha = alpha;
+  info.phit = phit;
+  info.warmup = warmup_iters;
+  info.iters = bench_iters;
+  info.target_fits = target_fits;
+  info.draft_fits = draft_fits;
+  print_bench_header(info);
+
+  if (!target_fits || !draft_fits || !models_fit_together(target_cfg, draft_cfg)) {
+    fprintf(stderr,
+      "Error: ssd-single requires target and draft weights to fit together on GPU 0.\n");
+    exit(1);
+  }
+
+  ComponentTimes ct;
+  if (!opts.skip_component) {
+    const int F_eff = F > 0 ? F : 1;
+    ct.draft_step_ms = bench_single_pass(draft_cfg, 1, warmup_iters, bench_iters);
+    const float draft_fanout_ms = F_eff > 1
+      ? bench_single_pass(draft_cfg, F_eff, warmup_iters, bench_iters)
+      : ct.draft_step_ms;
+    ct.draft_total_ms = ct.draft_step_ms * K;
+    ct.prespec_ms = draft_fanout_ms * K;
+    ct.target_verify_ms = bench_single_pass(target_cfg, K, warmup_iters, bench_iters);
+  }
+  print_components(info, ct);
+
+  BenchResult br;
+  if (!opts.skip_e2e) {
+    br = bench_ssd_e2e_single(target_cfg, draft_cfg, K, F, N, alpha, phit,
+                              warmup_iters, bench_iters);
+  }
+  print_result(info, br);
+  if (opts.csv) print_csv_row(info, ct, br);
+}
+
+
+===============================================
+File: bench_ssd_single.h
+===============================================
+
+// bench_ssd_single.h
+// SSD scheduling benchmark using two workers on one GPU.
+
+#pragma once
+
+#include "bench_common.h"
+#include "config.h"
+
+void run_ssd_single_benchmark(
+  const ModelConfig& target_model,
+  const ModelConfig& draft_model,
+  int K,
+  int F,
+  int N,
+  float alpha,
+  float phit,
+  int warmup,
+  int iters,
+  const BenchOpts& opts
+);
+
+
+===============================================
+File: bench_ssd.cu
+===============================================
+
+// bench_ssd.cu
+// SSD benchmark implementations.
+
+#include <cstdio>
+#include <cmath>
+#include <vector>
+#include <random>
+#include <algorithm>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+
+#include "check.h"
+#include "config.h"
+#include "gpu_context.h"
+#include "forward_single.h"
+#include "bench_common.h"
+
+#ifdef USE_NCCL
+#include <thread>
+#include <pthread.h>
+#include <atomic>
+#include <nccl.h>
+#include <nvtx3/nvToolsExt.h>
+#include "forward_tp.h"
+#endif
+
+
+#ifdef USE_NCCL
+
+// ---------------------------------------------------------------------------
+// Component timing helpers
+// ---------------------------------------------------------------------------
+
+// Time one draft forward pass at M tokens on a single GPU.
+static float bench_draft_pass_single(
+  const ModelConfig& draft_cfg,
+  int M,
+  int warmup_iters,
+  int bench_iters
+) {
+  cudaSetDevice(0);
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  int L = draft_cfg.n_layers;
+  std::vector<LayerWeights> weights(L);
+  for (int l = 0; l < L; l++)
+    alloc_layer_weights(weights[l], draft_cfg);
+  ActivationBuffers buf = alloc_activations(draft_cfg, M);
+
+  for (int i = 0; i < warmup_iters; i++)
+    forward_model(handle, draft_cfg, weights.data(), M,
+                  buf.x, buf.scratch1, buf.scratch2);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  cudaEvent_t start, stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  CHECK_CUDA(cudaEventRecord(start));
+  for (int i = 0; i < bench_iters; i++)
+    forward_model(handle, draft_cfg, weights.data(), M,
+                  buf.x, buf.scratch1, buf.scratch2);
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
+
+  float total_ms = 0;
+  CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+  free_activations(buf);
+  for (int l = 0; l < L; l++)
+    free_layer_weights(weights[l]);
+  CHECK_CUBLAS(cublasDestroy(handle));
+  return total_ms / bench_iters;
+}
+
+// Time one target verification forward pass (TP-sharded).
+static float bench_target_verify_tp(
+  const ModelConfig& target_cfg,
+  int T,
+  int K,
+  int warmup_iters,
+  int bench_iters
+) {
+  ncclUniqueId id;
+  CHECK_NCCL(ncclGetUniqueId(&id));
+
+  std::vector<float> results(T);
+  std::vector<std::thread> threads;
+
+  for (int r = 0; r < T; r++) {
+    threads.emplace_back([&, r]() {
+      GPUContext ctx = init_gpu(r, T, id);
+
+      int L = target_cfg.n_layers;
+      std::vector<TPLayerWeights> weights(L);
+      for (int l = 0; l < L; l++)
+        alloc_tp_layer_weights(weights[l], target_cfg, T);
+      ActivationBuffers buf = alloc_activations_tp(target_cfg, K, T);
+
+      for (int i = 0; i < warmup_iters; i++)
+        forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                         target_cfg, weights.data(), T, K,
+                         buf.x, buf.scratch1, buf.scratch2);
+      CHECK_CUDA(cudaStreamSynchronize(ctx.stream));
+
+      cudaEvent_t start, stop;
+      CHECK_CUDA(cudaEventCreate(&start));
+      CHECK_CUDA(cudaEventCreate(&stop));
+
+      CHECK_CUDA(cudaEventRecord(start, ctx.stream));
+      for (int i = 0; i < bench_iters; i++)
+        forward_model_tp(ctx.handle, ctx.comm, ctx.stream,
+                         target_cfg, weights.data(), T, K,
+                         buf.x, buf.scratch1, buf.scratch2);
+      CHECK_CUDA(cudaEventRecord(stop, ctx.stream));
+      CHECK_CUDA(cudaEventSynchronize(stop));
+
+      float total_ms = 0;
+      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+      results[r] = total_ms / bench_iters;
+
+      CHECK_CUDA(cudaEventDestroy(start));
+      CHECK_CUDA(cudaEventDestroy(stop));
+      free_activations(buf);
+      for (int l = 0; l < L; l++)
+        free_tp_layer_weights(weights[l]);
+      destroy_gpu(ctx);
+    });
+  }
+
+  for (auto& t : threads) t.join();
+  return results[0];
+}
+
+
+// ---------------------------------------------------------------------------
+// End-to-end SSD benchmark
+//
+// Launches T+1 threads:
+//   - ranks [0..T-1] are the tensor-parallel target
+//   - rank  T        is the dedicated draft GPU
+//
+// NCCL topology: two separate communicators.
+//   tp_comm:  size T, ranks [0..T-1]         (used by forward_model_tp)
+//   dt_comm:  size 2, [target rank 0, draft] (used for outcome/spec send-recv)
+//
+// Draft uses two CUDA streams (compute + comm) so that pre-speculation runs
+// concurrently with the outcome recv.
+// ---------------------------------------------------------------------------
+static BenchResult bench_ssd_e2e_tp(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int T,
+  int K,
+  int F,
+  int N,
+  float alpha,
+  float phit,
+  int warmup_iters,
+  int bench_iters
+) {
+  int total_ranks = T + 1;
+
+  ncclUniqueId tp_id, dt_id;
+  CHECK_NCCL(ncclGetUniqueId(&tp_id));
+  CHECK_NCCL(ncclGetUniqueId(&dt_id));
+
+  std::vector<float> results(total_ranks);
+  std::vector<std::thread> threads;
+
+  pthread_barrier_t target_sync;
+  pthread_barrier_init(&target_sync, nullptr, T);
+  std::atomic<bool> round_done{false};
+
+  // Only rank 0 updates these
+  int total_tokens = 0;
+  int total_rounds = 0;
+  // Only draft updates this
+  int total_misses = 0;
+
+  int F_eff = F > 0 ? F : 1;
+
+  for (int r = 0; r < total_ranks; r++) {
+    threads.emplace_back([&, r]() {
+      bool is_draft = (r == T);
+      CHECK_CUDA(cudaSetDevice(r));
+
+      // -----------------------------------------------------------------
+      // Per-rank handles / streams
+      // -----------------------------------------------------------------
+      cublasHandle_t handle;
+      CHECK_CUBLAS(cublasCreate(&handle));
+      CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+      cudaStream_t compute_stream;
+      CHECK_CUDA(cudaStreamCreate(&compute_stream));
+      CHECK_CUBLAS(cublasSetStream(handle, compute_stream));
+
+      // Only draft needs an independent comm_stream (so pre-spec on
+      // compute_stream can overlap with recv on comm_stream). Target rank 0
+      // does its dt_comm ops on compute_stream (strictly sequential anyway:
+      // recv spec -> verify -> send outcome).
+      cudaStream_t comm_stream = nullptr;
+      if (is_draft) CHECK_CUDA(cudaStreamCreate(&comm_stream));
+
+      // -----------------------------------------------------------------
+      // NCCL comms
+      // -----------------------------------------------------------------
+      ncclComm_t tp_comm = nullptr;
+      ncclComm_t dt_comm = nullptr;
+
+      if (!is_draft) {
+        CHECK_NCCL(ncclCommInitRank(&tp_comm, T, tp_id, r));
+      }
+      if (is_draft) {
+        CHECK_NCCL(ncclCommInitRank(&dt_comm, 2, dt_id, 1));
+      } else if (r == 0) {
+        CHECK_NCCL(ncclCommInitRank(&dt_comm, 2, dt_id, 0));
+      }
+
+      // -----------------------------------------------------------------
+      // Weights & activations
+      // -----------------------------------------------------------------
+      std::vector<TPLayerWeights> target_w;
+      ActivationBuffers target_buf = {nullptr, nullptr, nullptr};
+      std::vector<LayerWeights> draft_w;
+      ActivationBuffers draft_buf_F = {nullptr, nullptr, nullptr};
+      ActivationBuffers draft_buf_1 = {nullptr, nullptr, nullptr};
+
+      if (is_draft) {
+        int dL = draft_cfg.n_layers;
+        draft_w.resize(dL);
+        for (int l = 0; l < dL; l++)
+          alloc_layer_weights(draft_w[l], draft_cfg);
+        draft_buf_F = alloc_activations(draft_cfg, F_eff);
+        draft_buf_1 = alloc_activations(draft_cfg, 1);
+      } else {
+        int tL = target_cfg.n_layers;
+        target_w.resize(tL);
+        for (int l = 0; l < tL; l++)
+          alloc_tp_layer_weights(target_w[l], target_cfg, T);
+        target_buf = alloc_activations_tp(target_cfg, K, T);
+      }
+
+      // NCCL buffers
+      // outcome: 3 ints  = [acc_len, bonus_id, done_flag]
+      // spec:    K halfs (dummy)
+      int*  outcome_buf = nullptr;
+      half* spec_buf    = nullptr;
+      if (is_draft || r == 0) {
+        CHECK_CUDA(cudaMalloc(&outcome_buf, 3 * sizeof(int)));
+        CHECK_CUDA(cudaMemset(outcome_buf, 0, 3 * sizeof(int)));
+        CHECK_CUDA(cudaMalloc(&spec_buf, K * sizeof(half)));
+        CHECK_CUDA(cudaMemset(spec_buf, 0x3C, K * sizeof(half)));
+      }
+
+      // -----------------------------------------------------------------
+      // RNG
+      // Target rank 0 samples Bernoulli(alpha) for acceptance (seed 42 to
+      // match bench_sd_e2e_tp).
+      // Draft samples Bernoulli(phit) for cache hit.
+      // -----------------------------------------------------------------
+      std::mt19937 rng(is_draft ? 1337 : 42);
+      std::bernoulli_distribution accept_dist(alpha);
+      std::bernoulli_distribution hit_dist(phit);
+
+      // -----------------------------------------------------------------
+      // Warmup
+      // -----------------------------------------------------------------
+      for (int i = 0; i < warmup_iters; i++) {
+        if (is_draft) {
+          for (int k = 0; k < K; k++)
+            forward_model(handle, draft_cfg, draft_w.data(), 1,
+                          draft_buf_1.x, draft_buf_1.scratch1, draft_buf_1.scratch2);
+          for (int k = 0; k < K; k++)
+            forward_model(handle, draft_cfg, draft_w.data(), F_eff,
+                          draft_buf_F.x, draft_buf_F.scratch1, draft_buf_F.scratch2);
+          CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+        } else {
+          forward_model_tp(handle, tp_comm, compute_stream,
+                           target_cfg, target_w.data(), T, K,
+                           target_buf.x, target_buf.scratch1, target_buf.scratch2);
+          CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+        }
+      }
+
+      // -----------------------------------------------------------------
+      // Timed region
+      // -----------------------------------------------------------------
+      cudaEvent_t start, stop;
+      CHECK_CUDA(cudaEventCreate(&start));
+      CHECK_CUDA(cudaEventCreate(&stop));
+
+      int host_outcome[3] = {0, 0, 0};
+      int local_misses = 0;
+
+      // NVTX range so `nsys --capture-range=nvtx -p bench@*` captures only
+      // this timed section (skipping allocation, warmup, etc.). Rank 0 alone
+      // pushes the range; nsys records all GPUs' activity during this window.
+      if (r == 0) nvtxRangePushA("bench");
+
+      CHECK_CUDA(cudaEventRecord(start, compute_stream));
+
+      for (int iter = 0; iter < bench_iters; iter++) {
+        int local_tokens = 0;
+        if (!is_draft) pthread_barrier_wait(&target_sync);
+        if (r == 0) round_done.store(false);
+        if (!is_draft) pthread_barrier_wait(&target_sync);
+
+        if (is_draft) {
+          // -----------------------------------------------------------
+          // Just-in-time speculation: no pre-spec available for round 0
+          // -----------------------------------------------------------
+          for (int k = 0; k < K; k++)
+            forward_model(handle, draft_cfg, draft_w.data(), 1,
+                          draft_buf_1.x, draft_buf_1.scratch1, draft_buf_1.scratch2);
+          CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+          CHECK_NCCL(ncclSend(spec_buf, K, ncclFloat16, 0, dt_comm, comm_stream));
+          CHECK_CUDA(cudaStreamSynchronize(comm_stream));
+
+          // -----------------------------------------------------------
+          // Steady-state
+          // -----------------------------------------------------------
+          while (true) {
+            // Pre-speculation for the next round's spec, launched async
+            // on compute_stream. This overlaps with target's verification
+            // of the spec we just sent. Batched M=F drafts F candidate
+            // branches in parallel.
+            for (int k = 0; k < K; k++)
+              forward_model(handle, draft_cfg, draft_w.data(), F_eff,
+                            draft_buf_F.x, draft_buf_F.scratch1, draft_buf_F.scratch2);
+
+            // Recv outcome from target on comm_stream (independent of
+            // compute_stream so it does not serialize with pre-spec)
+            CHECK_NCCL(ncclRecv(outcome_buf, 3, ncclInt32, 0, dt_comm, comm_stream));
+            CHECK_CUDA(cudaStreamSynchronize(comm_stream));
+            CHECK_CUDA(cudaMemcpy(host_outcome, outcome_buf,
+                                  3 * sizeof(int), cudaMemcpyDeviceToHost));
+
+            bool is_done = host_outcome[2] != 0;
+            if (is_done) {
+              // Drain pending pre-spec before exiting so the next bench
+              // iter starts from a clean stream
+              CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+              break;
+            }
+
+            // Wait for pre-speculation compute to finish before deciding
+            // hit/miss
+            CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+            bool cache_hit = hit_dist(rng);
+            if (!cache_hit) {
+              local_misses++;
+              // Fallback: the pre-speculation did not match the
+              // target's outcome, so run the just-in-time draft
+              for (int k = 0; k < K; k++)
+                forward_model(handle, draft_cfg, draft_w.data(), 1,
+                              draft_buf_1.x, draft_buf_1.scratch1, draft_buf_1.scratch2);
+              CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+            }
+
+            CHECK_NCCL(ncclSend(spec_buf, K, ncclFloat16, 0, dt_comm, comm_stream));
+            CHECK_CUDA(cudaStreamSynchronize(comm_stream));
+          }
+        } else {
+          // -----------------------------------------------------------
+          // Target rank (any of 0..T-1)
+          // -----------------------------------------------------------
+          while (true) {
+            // Rank 0: receive the speculation from draft (the subsequent
+            // forward_model_tp all-reduce will wait for it to complete via
+            // stream ordering)
+            if (r == 0) {
+              CHECK_NCCL(ncclRecv(spec_buf, K, ncclFloat16, 1, dt_comm, compute_stream));
+            }
+            pthread_barrier_wait(&target_sync);
+
+            // All target ranks verify
+            forward_model_tp(handle, tp_comm, compute_stream,
+                             target_cfg, target_w.data(), T, K,
+                             target_buf.x, target_buf.scratch1, target_buf.scratch2);
+            CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+            if (r == 0) {
+              // Synthetic Bernoulli(alpha) acceptance
+              int accepted = 0;
+              for (int k = 0; k < K; k++) {
+                if (accept_dist(rng))
+                  accepted++;
+                else
+                  break;
+              }
+              local_tokens += accepted + 1;
+              total_rounds++;
+
+              int is_done = (local_tokens >= N) ? 1 : 0;
+              if (is_done) {
+                total_tokens += local_tokens;
+                round_done.store(true);
+              }
+
+              int outcome_host[3] = {accepted, 0, is_done};
+              CHECK_CUDA(cudaMemcpyAsync(outcome_buf, outcome_host, 3 * sizeof(int),
+                                         cudaMemcpyHostToDevice, compute_stream));
+              CHECK_NCCL(ncclSend(outcome_buf, 3, ncclInt32, 1, dt_comm, compute_stream));
+              CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+            }
+            pthread_barrier_wait(&target_sync);
+
+            if (round_done.load()) break;
+          }
+        }
+      }
+
+      CHECK_CUDA(cudaEventRecord(stop, compute_stream));
+      CHECK_CUDA(cudaEventSynchronize(stop));
+
+      if (r == 0) nvtxRangePop();
+
+      float total_ms = 0;
+      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+      results[r] = total_ms;
+
+      if (is_draft) total_misses += local_misses;
+
+      // -----------------------------------------------------------------
+      // Cleanup
+      // -----------------------------------------------------------------
+      CHECK_CUDA(cudaEventDestroy(start));
+      CHECK_CUDA(cudaEventDestroy(stop));
+
+      if (is_draft) {
+        free_activations(draft_buf_F);
+        free_activations(draft_buf_1);
+        for (int l = 0; l < (int)draft_w.size(); l++)
+          free_layer_weights(draft_w[l]);
+      } else {
+        free_activations(target_buf);
+        for (int l = 0; l < (int)target_w.size(); l++)
+          free_tp_layer_weights(target_w[l]);
+      }
+      if (outcome_buf) cudaFree(outcome_buf);
+      if (spec_buf)    cudaFree(spec_buf);
+      if (comm_stream) CHECK_CUDA(cudaStreamDestroy(comm_stream));
+      CHECK_CUDA(cudaStreamDestroy(compute_stream));
+      CHECK_CUBLAS(cublasDestroy(handle));
+      if (tp_comm) ncclCommDestroy(tp_comm);
+      if (dt_comm) ncclCommDestroy(dt_comm);
+    });
+  }
+
+  for (auto& t : threads) t.join();
+  pthread_barrier_destroy(&target_sync);
+
+  BenchResult br;
+  br.e2e_ms     = results[0] / bench_iters;
+  br.avg_tokens = static_cast<float>(total_tokens) / bench_iters;
+  br.avg_rounds = static_cast<float>(total_rounds) / bench_iters;
+  br.miss_rate  = (total_rounds > 0)
+    ? static_cast<float>(total_misses) / total_rounds
+    : 0.0f;
+  br.throughput_tok_s = br.e2e_ms > 0
+    ? br.avg_tokens * 1000.0f / br.e2e_ms
+    : 0.0f;
+  return br;
+}
+
+#endif // USE_NCCL
+
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+void run_ssd_benchmark(
+  const ModelConfig& target_cfg,
+  const ModelConfig& draft_cfg,
+  int tp,
+  int K,
+  int F,
+  int N,
+  float alpha,
+  float phit,
+  int warmup_iters,
+  int bench_iters,
+  const BenchOpts& opts
+) {
+  #ifndef USE_NCCL
+    (void)target_cfg; (void)draft_cfg; (void)tp; (void)K; (void)F;
+    (void)N; (void)alpha; (void)phit; (void)warmup_iters; (void)bench_iters;
+    (void)opts;
+    fprintf(stderr, "Error: SSD mode requires building with USE_NCCL=1\n");
+    exit(1);
+  #else
+
+  bool target_fits = model_fits(target_cfg, tp);
+  bool draft_fits  = model_fits(draft_cfg, 1);
+
+  BenchInfo info;
+  info.mode = "ssd";
+  info.target = &target_cfg;
+  info.draft  = &draft_cfg;
+  info.tp = tp;
+  info.K = K;
+  info.F = F;
+  info.N = N;
+  info.alpha = alpha;
+  info.phit  = phit;
+  info.warmup = warmup_iters;
+  info.iters  = bench_iters;
+  info.target_fits = target_fits;
+  info.draft_fits  = draft_fits;
+
+  print_bench_header(info);
+
+  if (!target_fits || !draft_fits) {
+    fprintf(stderr,
+      "Error: SSD end-to-end requires both target (TP=%d) and draft to fit in GPU memory.\n",
+      tp);
+    exit(1);
+  }
+
+  // Component timing
+  ComponentTimes ct;
+  if (!opts.skip_component) {
+    int F_eff = F > 0 ? F : 1;
+    ct.draft_step_ms = bench_draft_pass_single(draft_cfg, 1, warmup_iters, bench_iters);
+    float draft_fanout_ms = (F_eff > 1)
+      ? bench_draft_pass_single(draft_cfg, F_eff, warmup_iters, bench_iters)
+      : ct.draft_step_ms;
+    ct.draft_total_ms   = ct.draft_step_ms * K;
+    ct.prespec_ms       = draft_fanout_ms * K;
+    ct.target_verify_ms = bench_target_verify_tp(target_cfg, tp, K, warmup_iters, bench_iters);
+  }
+  print_components(info, ct);
+
+  // End-to-end
+  BenchResult br;
+  if (!opts.skip_e2e) {
+    br = bench_ssd_e2e_tp(target_cfg, draft_cfg, tp, K, F, N, alpha, phit,
+                          warmup_iters, bench_iters);
+  }
+  print_result(info, br);
+
+  if (opts.csv) print_csv_row(info, ct, br);
+
+#endif // USE_NCCL
+}
+
+
+===============================================
+File: bench_ssd.h
+===============================================
+
+// bench_ssd.h
+// SSD benchmark: tensor-parallel target + dedicated draft GPU.
+
+#pragma once
+
+#include "bench_common.h"
+#include "config.h"
+
+void run_ssd_benchmark(
+  const ModelConfig& target_model,
+  const ModelConfig& draft_model,
+  int tp,
+  int K,
+  int F,
+  int N,
+  float alpha,
+  float phit,
+  int warmup,
+  int iters,
+  const BenchOpts& opts
+);
+
+
+===============================================
+File: check.h
+===============================================
+
+// check.h
+// Error-checking macros for CUDA, cuBLAS, and NCCL.
+
+#pragma once
+
+#include <cstdio>
+#include <cstdlib>
+
+#define CHECK_CUDA(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = (call);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,         \
+              cudaGetErrorString(err));                                        \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+#define CHECK_CUBLAS(call)                                                     \
+  do {                                                                         \
+    cublasStatus_t status = (call);                                            \
+    if (status != CUBLAS_STATUS_SUCCESS) {                                     \
+      fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__,       \
+              status);                                                         \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+#define CHECK_NCCL(call)                                                       \
+  do {                                                                         \
+    ncclResult_t res = (call);                                                 \
+    if (res != ncclSuccess) {                                                  \
+      fprintf(stderr, "NCCL error at %s:%d: %s\n", __FILE__, __LINE__,         \
+              ncclGetErrorString(res));                                        \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+
+===============================================
+File: config.h
+===============================================
+
+// config.h
+
+#pragma once
+
+#include <string>
+#include <unordered_map>
+#include <cstdio>
+#include <cstdlib>
+
+// ---------------------------------------------------------------------------
+// Model config struct
+// ---------------------------------------------------------------------------
+struct ModelConfig {
+  std::string name;
+  int d_model;
+  int n_heads;
+  int n_kv_heads;
+  int head_dim;
+  int d_ff;
+  int n_layers;
+
+  int q_dim()  const { return n_heads * head_dim; }
+  int kv_dim() const { return n_kv_heads * head_dim; }
+
+  // Total weight bytes for one layer (FP16)
+  size_t layer_weight_bytes() const {
+    size_t d   = static_cast<size_t>(d_model);
+    size_t dq  = static_cast<size_t>(q_dim());
+    size_t dkv = static_cast<size_t>(kv_dim());
+    size_t dff = static_cast<size_t>(d_ff);
+
+    return 2 * (       // 2 bytes per FP16 element
+      d * dq   +       // W_q
+      d * dkv  +       // W_k
+      d * dkv  +       // W_v
+      dq * d   +       // W_o
+      d * dff  +       // W_gate
+      d * dff  +       // W_up
+      dff * d          // W_down
+    );
+  }
+
+  // Total weight bytes for one layer sharded across T GPUs
+  size_t tp_layer_weight_bytes(int T) const {
+    size_t d   = static_cast<size_t>(d_model);
+    size_t dq  = static_cast<size_t>(q_dim() / T);
+    size_t dkv = static_cast<size_t>(kv_dim() / T);
+    size_t dff = static_cast<size_t>(d_ff / T);
+
+    return 2 * (       // 2 bytes per FP16 element
+      d * dq   +       // W_q
+      d * dkv  +       // W_k
+      d * dkv  +       // W_v
+      dq * d   +       // W_o
+      d * dff  +       // W_gate
+      d * dff  +       // W_up
+      dff * d          // W_down
+    );
+  }
+
+  // Total weight bytes for the full model
+  size_t total_weight_bytes() const {
+    return layer_weight_bytes() * n_layers;
+  }
+
+  // Total weight bytes per GPU for TP-sharded full model
+  size_t total_tp_weight_bytes(int T) const {
+    return tp_layer_weight_bytes(T) * n_layers;
+  }
+
+  // Arithmetic intensity of one layer (FLOPs / bytes)
+  double arith_intensity(int M) const {
+    double d   = static_cast<double>(d_model);
+    double dq  = static_cast<double>(q_dim());
+    double dkv = static_cast<double>(kv_dim());
+    double dff = static_cast<double>(d_ff);
+    double m   = static_cast<double>(M);
+
+    double flops = 0;
+    double bytes = 0;
+
+    // {M, N, K} for each of the 7 GEMMs
+    double gemm_dims[][3] = {
+      {m, dq, d}, {m, dkv, d}, {m, dkv, d}, {m, d, dq},
+      {m, dff, d}, {m, dff, d}, {m, d, dff}
+    };
+
+    for (auto& g : gemm_dims) {
+      double gm = g[0], gn = g[1], gk = g[2];
+      flops += 2.0 * gm * gn * gk;
+      bytes += (gm * gk + gk * gn + gm * gn) * 2.0; // FP16
+    }
+
+    return flops / bytes;
+  }
+
+  // Check if dimensions are evenly divisible by TP degree
+  bool divisible_by(int T) const {
+    return q_dim() % T == 0 && kv_dim() % T == 0 && d_ff % T == 0;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Model registry
+// ---------------------------------------------------------------------------
+inline const std::unordered_map<std::string, ModelConfig>& model_registry() {
+  static const std::unordered_map<std::string, ModelConfig> models = {
+    {"tiny",      {"Tiny",          512,  8,  4, 64, 2048,  4}},
+    {"llama-1b",  {"Llama-3.2-1B",  2048, 32, 8,  64,  8192, 16}},
+    {"llama-8b",  {"Llama-3.1-8B",  4096, 32, 8, 128, 14336, 32}},
+    {"llama-70b", {"Llama-3.1-70B", 8192, 64, 8, 128, 28672, 80}},
+  };
+  return models;
+}
+
+inline const ModelConfig& lookup_model(const std::string& key) {
+  auto& models = model_registry();
+  auto it = models.find(key);
+  if (it == models.end()) {
+    fprintf(stderr, "Unknown model: '%s'. Options:", key.c_str());
+    for (auto& [k, _] : models) fprintf(stderr, " %s", k.c_str());
+    fprintf(stderr, "\n");
+    exit(1);
+  }
+  return it->second;
+}
+
+===============================================
+File: forward_single.cu
+===============================================
+
+// forward_single.cu
+// Single-GPU forward pass implementations.
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+
+#include "check.h"
+#include "gemm.h"
+#include "forward_single.h"
+
+// ---------------------------------------------------------------------------
+// Weight allocation
+// ---------------------------------------------------------------------------
+
+// Allocate weight matrices for one layer, fill with ~1.0
+size_t alloc_layer_weights(LayerWeights& w, const ModelConfig& cfg) {
+  size_t total = 0;
+
+  auto alloc = [&](half** ptr, int rows, int cols) {
+    size_t bytes = static_cast<size_t>(rows) * cols * sizeof(half);
+    CHECK_CUDA(cudaMalloc(ptr, bytes));
+    CHECK_CUDA(cudaMemset(*ptr, 0x3C, bytes)); // ~1.0 in FP16
+    total += bytes;
+  };
+
+  int d    = cfg.d_model;
+  int d_q  = cfg.q_dim();
+  int d_kv = cfg.kv_dim();
+  int d_ff = cfg.d_ff;
+
+  alloc(&w.W_q,    d, d_q);
+  alloc(&w.W_k,    d, d_kv);
+  alloc(&w.W_v,    d, d_kv);
+  alloc(&w.W_o,    d_q, d);
+  alloc(&w.W_gate, d, d_ff);
+  alloc(&w.W_up,   d, d_ff);
+  alloc(&w.W_down, d_ff, d);
+
+  return total;
+}
+
+void free_layer_weights(LayerWeights& w) {
+  cudaFree(w.W_q);
+  cudaFree(w.W_k);
+  cudaFree(w.W_v);
+  cudaFree(w.W_o);
+  cudaFree(w.W_gate);
+  cudaFree(w.W_up);
+  cudaFree(w.W_down);
+}
+
+// ---------------------------------------------------------------------------
+// Forward passes
+// ---------------------------------------------------------------------------
+void forward_layer(
+  cublasHandle_t handle,
+  const ModelConfig& cfg,
+  const LayerWeights& w,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+) {
+  int d    = cfg.d_model;
+  int d_q  = cfg.q_dim();
+  int d_kv = cfg.kv_dim();
+  int d_ff = cfg.d_ff;
+
+  // --- Attention projections ---
+  // Q: [M, d] x [d, d_q] (writing to scratch1)
+  hgemm(handle, M, d_q,  d, x, w.W_q, scratch1);
+  // K: [M, d] x [d, d_kv] (writing to scratch2)
+  hgemm(handle, M, d_kv, d, x, w.W_k, scratch2);
+  // V: [M, d] x [d, d_kv] (writing to scratch2)
+  hgemm(handle, M, d_kv, d, x, w.W_v, scratch2);
+  // O: [M, d_q] x [d_q, d] (reading from scratch1, writing to x)
+  hgemm(handle, M, d, d_q, scratch1, w.W_o, x);
+
+  // --- FFN projections ---
+  // Gate: [M, d] x [d, d_ff] (writing to scratch1)
+  hgemm(handle, M, d_ff, d, x, w.W_gate, scratch1);
+  // Up: [M, d] x [d, d_ff] (writing to scratch2)
+  hgemm(handle, M, d_ff, d, x, w.W_up,   scratch2);
+  // Down: [M, d_ff] x [d_ff, d] (reading from scratch1, writing to x)
+  hgemm(handle, M, d, d_ff, scratch1, w.W_down, x);
+}
+
+void forward_model(
+  cublasHandle_t handle,
+  const ModelConfig& cfg,
+  LayerWeights* all_weights,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+) {
+  for (int l = 0; l < cfg.n_layers; l++)
+    forward_layer(handle, cfg, all_weights[l], M, x, scratch1, scratch2);
+}
+
+// ---------------------------------------------------------------------------
+// Activation buffer
+// ---------------------------------------------------------------------------
+ActivationBuffers alloc_activations(const ModelConfig& cfg, int M) {
+  ActivationBuffers buf;
+  int max_dim = std::max(cfg.q_dim(), cfg.d_ff);
+  CHECK_CUDA(cudaMalloc(
+    &buf.x, static_cast<size_t>(M) * cfg.d_model * sizeof(half)
+  ));
+  CHECK_CUDA(cudaMalloc(
+    &buf.scratch1, static_cast<size_t>(M) * max_dim * sizeof(half)
+  ));
+  CHECK_CUDA(cudaMalloc(
+    &buf.scratch2, static_cast<size_t>(M) * max_dim * sizeof(half)
+  ));
+  CHECK_CUDA(cudaMemset(
+    buf.x, 0x3C, static_cast<size_t>(M) * cfg.d_model * sizeof(half)
+  ));
+  return buf;
+}
+
+void free_activations(ActivationBuffers& buf) {
+  cudaFree(buf.x);
+  cudaFree(buf.scratch1);
+  cudaFree(buf.scratch2);
+}
+
+
+===============================================
+File: forward_single.h
+===============================================
+
+// forward_single.h
+// Single-GPU forward pass functions.
+
+#pragma once
+
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include "config.h"
+
+// ---------------------------------------------------------------------------
+// Weight buffers for one layer (FP16, single GPU)
+// ---------------------------------------------------------------------------
+struct LayerWeights {
+  half* W_q;     // [d_model, q_dim]
+  half* W_k;     // [d_model, kv_dim]
+  half* W_v;     // [d_model, kv_dim]
+  half* W_o;     // [q_dim,   d_model]
+  half* W_gate;  // [d_model, d_ffn]
+  half* W_up;    // [d_model, d_ffn]
+  half* W_down;  // [d_ffn,   d_model]
+};
+
+// Allocate and fill weight matrices for one layer. Returns total bytes.
+size_t alloc_layer_weights(LayerWeights& w, const ModelConfig& cfg);
+void free_layer_weights(LayerWeights& w);
+
+// ---------------------------------------------------------------------------
+// Forward passes
+// ---------------------------------------------------------------------------
+
+// Forward pass for one layer (GEMMs only)
+//
+// Sequence of ops in a real Llama layer:
+//   1. RMSNorm (skip -- negligible time)
+//   2. Q = x @ W_q      [M, d] x [d, d_q]          -> [M, d_q]
+//   3. K = x @ W_k      [M, d] x [d, d_kv]         -> [M, d_kv]
+//   4. V = x @ W_v      [M, d] x [d, d_kv]         -> [M, d_kv]
+//   5. Attention (skip for now -- separate kernel, not a GEMM)
+//   6. O = attn @ W_o   [M, d_q] x [d_q, d]        -> [M, d]  (d_q == d)
+//   7. RMSNorm (skip)
+//   8. gate = x @ W_gate [M, d] x [d, d_ffn]       -> [M, d_ffn]
+//   9. up   = x @ W_up   [M, d] x [d, d_ffn]       -> [M, d_ffn]
+//  10. SiLU(gate) * up   (skip -- element-wise)
+//  11. down = act @ W_down [M, d_ffn] x [d_ffn, d] -> [M, d]
+//
+// Total: 7 GEMMs per layer.
+void forward_layer(
+  cublasHandle_t handle,
+  const ModelConfig& cfg,
+  const LayerWeights& w,
+  int M,           // number of tokens (1 for AR, K for verification)
+  half* x,         // [M, d] input activations
+  half* scratch1,  // workspace >= [M, max(d_q, d_ffn)]
+  half* scratch2   // workspace >= [M, max(d_kv, d_ffn)]
+);
+
+// Full model: L layers sequentially
+void forward_model(
+  cublasHandle_t handle,
+  const ModelConfig& cfg,
+  LayerWeights* all_weights,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+);
+
+// ---------------------------------------------------------------------------
+// Activation buffers
+// ---------------------------------------------------------------------------
+struct ActivationBuffers {
+  half* x;
+  half* scratch1;
+  half* scratch2;
+};
+
+ActivationBuffers alloc_activations(const ModelConfig& cfg, int M);
+void free_activations(ActivationBuffers& buf);
+
+
+===============================================
+File: forward_tp.cu
+===============================================
+
+// forward_tp.cu
+// Multi-GPU tensor-parallel forward pass implementations.
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <nccl.h>
+
+#include "check.h"
+#include "gemm.h"
+#include "forward_tp.h"
+
+// ---------------------------------------------------------------------------
+// Weight allocation
+// ---------------------------------------------------------------------------
+size_t alloc_tp_layer_weights(
+  TPLayerWeights& w,
+  const ModelConfig& cfg,
+  int T
+) {
+  size_t total = 0;
+
+  auto alloc = [&](half** ptr, int rows, int cols) {
+    size_t bytes = static_cast<size_t>(rows) * cols * sizeof(half);
+    CHECK_CUDA(cudaMalloc(ptr, bytes));
+    CHECK_CUDA(cudaMemset(*ptr, 0x3C, bytes));
+    total += bytes;
+  };
+
+  int d    = cfg.d_model;
+  int d_q  = cfg.q_dim()  / T;
+  int d_kv = cfg.kv_dim() / T;
+  int d_ff = cfg.d_ff    / T;
+
+  alloc(&w.W_q,    d, d_q);
+  alloc(&w.W_k,    d, d_kv);
+  alloc(&w.W_v,    d, d_kv);
+  alloc(&w.W_o,    d_q, d);
+  alloc(&w.W_gate, d, d_ff);
+  alloc(&w.W_up,   d, d_ff);
+  alloc(&w.W_down, d_ff, d);
+
+  return total;
+}
+
+void free_tp_layer_weights(TPLayerWeights& w) {
+  cudaFree(w.W_q);
+  cudaFree(w.W_k);
+  cudaFree(w.W_v);
+  cudaFree(w.W_o);
+  cudaFree(w.W_gate);
+  cudaFree(w.W_up);
+  cudaFree(w.W_down);
+}
+
+// ---------------------------------------------------------------------------
+// Forward passes
+// ---------------------------------------------------------------------------
+
+void forward_layer_tp(
+  cublasHandle_t handle,
+  ncclComm_t comm,
+  cudaStream_t stream,
+  const ModelConfig& cfg,
+  const TPLayerWeights& w,
+  int T,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+) {
+  int d    = cfg.d_model;
+  int d_q  = cfg.q_dim()  / T;
+  int d_kv = cfg.kv_dim() / T;
+  int d_ff = cfg.d_ff    / T;
+
+  // --- Attention projections (column-parallel) ---
+  hgemm(handle, M, d_q,  d, x, w.W_q, scratch1);
+  hgemm(handle, M, d_kv, d, x, w.W_k, scratch2);
+  hgemm(handle, M, d_kv, d, x, w.W_v, scratch2);
+
+  // O (row-parallel, partial sum)
+  hgemm(handle, M, d, d_q, scratch1, w.W_o, x);
+
+  // All-reduce after attention
+  CHECK_NCCL(ncclAllReduce(
+    x, x, static_cast<size_t>(M) * d,
+    ncclFloat16, ncclSum, comm, stream
+  ));
+
+  // --- FFN projections (column-parallel) ---
+  hgemm(handle, M, d_ff, d, x, w.W_gate, scratch1);
+  hgemm(handle, M, d_ff, d, x, w.W_up,   scratch2);
+
+  // Down (row-parallel, partial sum)
+  hgemm(handle, M, d, d_ff, scratch1, w.W_down, x);
+
+  // All-reduce after FFN
+  CHECK_NCCL(ncclAllReduce(
+    x, x, static_cast<size_t>(M) * d,
+    ncclFloat16, ncclSum, comm, stream
+  ));
+}
+
+void forward_model_tp(
+  cublasHandle_t handle,
+  ncclComm_t comm,
+  cudaStream_t stream,
+  const ModelConfig& cfg,
+  TPLayerWeights* all_weights,
+  int T,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+) {
+  for (int l = 0; l < cfg.n_layers; l++)
+    forward_layer_tp(
+      handle, comm, stream, cfg, all_weights[l], T, M, x, scratch1, scratch2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Activation buffers (TP-aware)
+// ---------------------------------------------------------------------------
+ActivationBuffers alloc_activations_tp(const ModelConfig& cfg, int M, int T) {
+  ActivationBuffers buf;
+  int max_local = std::max(cfg.q_dim() / T, cfg.d_ff / T);
+
+  CHECK_CUDA(cudaMalloc(
+    &buf.x, static_cast<size_t>(M) * cfg.d_model * sizeof(half)
+  ));
+  CHECK_CUDA(cudaMalloc(
+    &buf.scratch1, static_cast<size_t>(M) * max_local * sizeof(half)
+  ));
+  CHECK_CUDA(cudaMalloc(
+    &buf.scratch2, static_cast<size_t>(M) * max_local * sizeof(half)
+  ));
+  CHECK_CUDA(cudaMemset(
+    buf.x, 0x3C, static_cast<size_t>(M) * cfg.d_model * sizeof(half)
+  ));
+  return buf;
+}
+
+
+===============================================
+File: forward_tp.h
+===============================================
+
+// forward_tp.h
+// Multi-GPU tensor-parallel forward pass functions.
+
+#pragma once
+
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <nccl.h>
+#include "config.h"
+#include "forward_single.h"  // ActivationBuffers
+
+// ---------------------------------------------------------------------------
+// Tensor-parallel weight buffers for one layer on one GPU.
+//
+// Sharding strategy (Megatron-style):
+//   Column-parallel: W_q, W_k, W_v, W_gate, W_up  -> shard output dim
+//     Each GPU stores [d_model, dim/T] slice
+//   Row-parallel:    W_o, W_down                  -> shard input dim
+//     Each GPU stores [dim/T, d_model] slice
+//     Output is partial sum -> needs all-reduce
+// ---------------------------------------------------------------------------
+struct TPLayerWeights {
+  half* W_q;     // [d_model, q_dim/T]     column-parallel
+  half* W_k;     // [d_model, kv_dim/T]    column-parallel
+  half* W_v;     // [d_model, kv_dim/T]    column-parallel
+  half* W_o;     // [q_dim/T, d_model]     row-parallel
+  half* W_gate;  // [d_model, d_ffn/T]     column-parallel
+  half* W_up;    // [d_model, d_ffn/T]     column-parallel
+  half* W_down;  // [d_ffn/T, d_model]     row-parallel
+};
+
+size_t alloc_tp_layer_weights(TPLayerWeights& w, const ModelConfig& cfg, int T);
+void free_tp_layer_weights(TPLayerWeights& w);
+
+// ---------------------------------------------------------------------------
+// Forward passes
+// ---------------------------------------------------------------------------
+
+// One layer: 7 GEMMs + 2 all-reduces (after O and after down)
+void forward_layer_tp(
+  cublasHandle_t handle,
+  ncclComm_t comm,
+  cudaStream_t stream,
+  const ModelConfig& cfg,
+  const TPLayerWeights& w,
+  int T,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+);
+
+// Full model: L layers sequentially
+void forward_model_tp(
+  cublasHandle_t handle,
+  ncclComm_t comm,
+  cudaStream_t stream,
+  const ModelConfig& cfg,
+  TPLayerWeights* all_weights,
+  int T,
+  int M,
+  half* x,
+  half* scratch1,
+  half* scratch2
+);
+
+// ---------------------------------------------------------------------------
+// Activation buffers (TP-aware sizing)
+// ---------------------------------------------------------------------------
+ActivationBuffers alloc_activations_tp(const ModelConfig& cfg, int M, int T);
+
+
+===============================================
+File: gemm.h
+===============================================
+
+// gemm.h
+
+#pragma once
+
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include "check.h"
+
+// Given A [MxK], B [KxN], and C [MxN], computes C = A @ B [MxN].
+// cuBLAS assumes column-major layout. So, it sees A^T [KxM], B^T [NxK],
+// and C^T [NxM], all column-major. And computes C^T = B^T @ A^T [NxM],
+// which is equal to C = A @ B [MxN].
+inline void hgemm(
+  cublasHandle_t handle,
+  int M, int N, int K,
+  const half* A, const half* B, half* C
+) {
+  const half alpha = __float2half(1.0f);
+  const half beta  = __float2half(0.0f);
+
+  CHECK_CUBLAS(
+    // Signature: 
+    //   (handle, 
+    //    opA, opB, 
+    //    m, n, k, 
+    //    alpha, 
+    //    A, lda, 
+    //    B, ldb, 
+    //    beta, 
+    //    C, ldc)
+    // Notes:
+    //  - m = N, n = M, k = K -- the dimensions of the column-major C^T
+    //  - opA = opB = CUBLAS_OP_N -- no transpose
+    //  - lda = leading dimension A, etc for ldb and ldc
+    cublasHgemm(
+      handle,
+      CUBLAS_OP_N, CUBLAS_OP_N,
+      N, M, K,
+      &alpha,
+      B, N,
+      A, K,
+      &beta,
+      C, N
+    )
+  );     
+}
+
+
+===============================================
+File: gpu_context.h
+===============================================
+
+// gpu_context.h
+// Shared GPU utilities for benchmark modules.
+
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include "check.h"
+#include "config.h"
+
+// ---------------------------------------------------------------------------
+// GPU memory
+// ---------------------------------------------------------------------------
+
+inline size_t get_free_gpu_memory(int device = 0) {
+  CHECK_CUDA(cudaSetDevice(device));
+  size_t free_mem, total_mem;
+  CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+  return free_mem;
+}
+
+inline bool model_fits(const ModelConfig& cfg, int tp) {
+  size_t free_mem = get_free_gpu_memory(0);
+  size_t weight_bytes = (tp == 1)
+    ? cfg.total_weight_bytes()
+    : cfg.total_tp_weight_bytes(tp);
+  return weight_bytes < static_cast<size_t>(free_mem * 0.85);
+}
+
+// ---------------------------------------------------------------------------
+// Per-GPU context for TP benchmarks
+// ---------------------------------------------------------------------------
+
+#ifdef USE_NCCL
+#include <nccl.h>
+
+struct GPUContext {
+  cublasHandle_t handle;
+  ncclComm_t comm;
+  cudaStream_t stream;
+};
+
+inline GPUContext init_gpu(int rank, int T, ncclUniqueId nccl_id) {
+  GPUContext ctx;
+  CHECK_CUDA(cudaSetDevice(rank));
+  CHECK_NCCL(ncclCommInitRank(&ctx.comm, T, nccl_id, rank));
+  CHECK_CUBLAS(cublasCreate(&ctx.handle));
+  CHECK_CUBLAS(cublasSetMathMode(ctx.handle, CUBLAS_TENSOR_OP_MATH));
+  CHECK_CUDA(cudaStreamCreate(&ctx.stream));
+  CHECK_CUBLAS(cublasSetStream(ctx.handle, ctx.stream));
+  return ctx;
+}
+
+inline void destroy_gpu(GPUContext& ctx) {
+  CHECK_CUBLAS(cublasDestroy(ctx.handle));
+  CHECK_CUDA(cudaStreamDestroy(ctx.stream));
+  ncclCommDestroy(ctx.comm);
+}
+
+#endif // USE_NCCL
+
+===============================================
+File: main.cu
+===============================================
+
+// main.cu
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <unordered_map>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+#include "config.h"
+#include "bench_common.h"
+#include "bench_ar.h"
+#include "bench_sd.h"
+#include "bench_ssd.h"
+#include "bench_ssd_single.h"
+
+// ---------------------------------------------------------------------------
+// CLI helpers
+// ---------------------------------------------------------------------------
+static void print_usage(const std::string& prog) {
+  printf(
+    "Usage: %s [options]\n"
+    "\n"
+    "Options:\n"
+    "  --target-model <name>   Target model (tiny, llama-1b, llama-8b, llama-70b)  [llama-8b]\n"
+    "  --draft-model  <name>   Draft model  (tiny, llama-1b, llama-8b, llama-70b)  [llama-1b]\n"
+    "  --tp           <int>    Tensor parallelism degree                     [1]\n"
+    "  --mode         <str>    Inference mode (ar, sd, ssd, ssd-single)      [ar]\n"
+    "  --K            <int>    Speculation length (sd/ssd only)              [4]\n"
+    "  --F            <int>    Fan-out for pre-speculation (ssd only)        [4]\n"
+    "  --alpha        <float>  Acceptance rate (sd/ssd only)                 [0.9]\n"
+    "  --phit         <float>  Cache hit probability (ssd only)              [0.85]\n"
+    "  --N            <int>    Tokens to generate                            [128]\n"
+    "  --warmup       <int>    Warmup iterations                             [10]\n"
+    "  --iters        <int>    Benchmark iterations                          [20]\n"
+    "  --skip-component        Skip per-stage forward-pass timing\n"
+    "  --skip-e2e              Skip the end-to-end simulation\n"
+    "  --csv                   Emit one CSV row at the end (prefixed RESULT,)\n"
+    "  --csv-header            Print CSV header line and exit\n"
+    "  --help                  Show this message\n",
+    prog.c_str()
+  );
+}
+
+static std::string require_arg(
+  int argc,
+  char** argv,
+  int i,
+  const std::string& flag
+) {
+  if (i + 1 >= argc) {
+    fprintf(stderr, "Error: %s requires an argument\n", flag.c_str());
+    exit(1);
+  }
+  return argv[i + 1];
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+static void validate_tp(
+  const ModelConfig& model,
+  int tp,
+  const std::string& role
+) {
+  if (!model.divisible_by(tp)) {
+    fprintf(stderr,
+      "Error: %s model '%s' dimensions not evenly divisible by TP=%d\n"
+      "  q_dim=%d, kv_dim=%d, d_ff=%d\n",
+      role.c_str(), model.name.c_str(), tp,
+      model.q_dim(), model.kv_dim(), model.d_ff);
+    exit(1);
+  }
+}
+
+static void validate_gpu_count(int tp, const std::string& mode) {
+  int num_gpus;
+  cudaGetDeviceCount(&num_gpus);
+
+  int required = tp;
+  if (mode == "ssd") required = tp + 1;
+
+  if (required > num_gpus) {
+    fprintf(stderr,
+      "Error: mode '%s' with TP=%d requires %d GPU(s), but only %d available\n",
+      mode.c_str(), tp, required, num_gpus);
+    exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GPU info
+// ---------------------------------------------------------------------------
+
+static void print_gpu_info(int num_gpus) {
+  printf("GPUs:\n");
+  for (int i = 0; i < num_gpus; i++) {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, i);
+    cudaSetDevice(i);
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    printf(
+      "  [%d] %s | %.2f GB free / %.2f GB total | %d SMs\n",
+      i, prop.name,
+      free_mem / (1024.0 * 1024 * 1024),
+      total_mem / (1024.0 * 1024 * 1024),
+      prop.multiProcessorCount
+    );
+  }
+  printf("\n");
+}
+
+// ---------------------------------------------------------------------------
+int main(int argc, char** argv) {
+  // Defaults
+  std::string target_model_name = "llama-8b";
+  std::string draft_model_name = "llama-1b";
+  std::string mode = "ar";
+  int tp = 1;
+  int K = 4;
+  int F = 4;
+  float alpha = 0.9f;
+  float phit = 0.85f;
+  int N = 128;
+  int warmup = 10;
+  int iters = 20;
+  BenchOpts opts;
+  bool csv_header_only = false;
+
+  // Parse arguments
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--help" || arg == "-h") {
+      print_usage(argv[0]);
+      return 0;
+    } else if (arg == "--target-model") {
+      target_model_name = require_arg(argc, argv, i, arg); i++;
+    } else if (arg == "--draft-model") {
+      draft_model_name = require_arg(argc, argv, i, arg); i++;
+    } else if (arg == "--tp") {
+      tp = std::stoi(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--mode") {
+      mode = require_arg(argc, argv, i, arg); i++;
+    } else if (arg == "--K") {
+      K = std::stoi(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--F") {
+      F = std::stoi(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--alpha") {
+      alpha = std::stof(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--phit") {
+      phit = std::stof(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--N") {
+      N = std::stoi(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--warmup") {
+      warmup = std::stoi(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--iters") {
+      iters = std::stoi(require_arg(argc, argv, i, arg)); i++;
+    } else if (arg == "--skip-component") {
+      opts.skip_component = true;
+    } else if (arg == "--skip-e2e") {
+      opts.skip_e2e = true;
+    } else if (arg == "--csv") {
+      opts.csv = true;
+    } else if (arg == "--csv-header") {
+      csv_header_only = true;
+    } else {
+      fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
+      print_usage(argv[0]);
+      return 1;
+    }
+  }
+
+  // --csv-header is a utility flag: print and exit, no GPU work.
+  if (csv_header_only) {
+    print_csv_header();
+    return 0;
+  }
+
+  // Validate mode
+  if (mode != "ar" && mode != "sd" && mode != "ssd" && mode != "ssd-single") {
+    fprintf(stderr, "Error: --mode must be one of: ar, sd, ssd, ssd-single (got '%s')\n", mode.c_str());
+    return 1;
+  }
+  // Validate tp
+  if (tp < 1) {
+    fprintf(stderr, "Error: --tp must be >= 1\n");
+    return 1;
+  }
+  if (mode == "ssd-single" && tp != 1) {
+    fprintf(stderr, "Error: mode 'ssd-single' requires --tp 1\n");
+    return 1;
+  }
+
+  // Resolve models
+  const ModelConfig target_model = lookup_model(target_model_name);
+  const ModelConfig draft_model = lookup_model(draft_model_name);
+
+  // Validate hardware
+  validate_gpu_count(tp, mode);
+  if (tp > 1) validate_tp(target_model, tp, "target");
+  if (mode == "sd" || mode == "ssd") {
+    if (tp > 1) validate_tp(draft_model, tp, "draft");
+  }
+
+  // Print env info
+  int num_gpus;
+  cudaGetDeviceCount(&num_gpus);
+  print_gpu_info(num_gpus);
+
+  // Dispatch
+  if (mode == "ar")
+    run_ar_benchmark(target_model, tp, N, warmup, iters, opts);
+  else if (mode == "sd")
+    run_sd_benchmark(target_model, draft_model, tp, K, N, alpha,
+                     warmup, iters, opts);
+  else if (mode == "ssd")
+    run_ssd_benchmark(target_model, draft_model, tp, K, F, N, alpha, phit,
+                      warmup, iters, opts);
+  else if (mode == "ssd-single")
+    run_ssd_single_benchmark(target_model, draft_model, K, F, N, alpha, phit,
+                             warmup, iters, opts);
+
+  return 0;
+}
+
+
+===============================================
+File: thread_safe_queue.h
+===============================================
+
+// thread_safe_queue.h
+// Blocking FIFO queue for communication between benchmark worker threads.
+
+#pragma once
+
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <utility>
+
+template <typename T>
+class ThreadSafeQueue {
+ public:
+  void push(T value) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      queue_.push(std::move(value));
+    }
+    not_empty_.notify_one();
+  }
+
+  T pop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    not_empty_.wait(lock, [this] { return !queue_.empty(); });
+    T value = std::move(queue_.front());
+    queue_.pop();
+    return value;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable not_empty_;
+  std::queue<T> queue_;
+};
+
