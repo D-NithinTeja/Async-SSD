@@ -21,7 +21,14 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 BINARY="${BINARY:-$PROJECT_ROOT/benchmark}"
 
-# Smoke-test parameters: small/fast so they work without real weights.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --binary) BINARY="$2"; shift 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Smoke-test parameters: small/fast so they run quickly.
 TARGET_MODEL="${TARGET_MODEL:-tiny}"
 DRAFT_MODEL="${DRAFT_MODEL:-tiny}"
 ITERS="${ITERS:-2}"
@@ -41,11 +48,12 @@ pass() { echo "  [PASS] $1"; (( PASS++ )) || true; }
 fail() { echo "  [FAIL] $1"; (( FAIL++ )) || true; }
 
 run_test() {
-  local name="$1"; shift
+  local name="$1"
+  local fn="$2"
   (( TESTS_RUN++ )) || true
   echo
   echo "TEST: $name"
-  "$@"
+  "$fn"
 }
 
 # Runs benchmark and captures stdout+stderr into variables.
@@ -78,9 +86,10 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Test 1: --csv-header prints a header and exits 0
+# Test Functions
 # ---------------------------------------------------------------------------
-run_test "csv-header prints header and exits 0" bash -c '
+
+test_csv_header() {
   run_bm --csv-header
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
@@ -94,48 +103,40 @@ run_test "csv-header prints header and exits 0" bash -c '
     fail "expected CSV header not found in output"
     echo "    stdout: $(echo "$BM_STDOUT" | head -3)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 2: invalid --mode returns non-zero exit code
-# ---------------------------------------------------------------------------
-run_test "invalid --mode bogus returns non-zero" bash -c '
-  run_bm --mode bogus --target-model '"$TARGET_MODEL"' --N '"$N"'
+test_invalid_mode() {
+  run_bm --mode bogus --target-model "$TARGET_MODEL" --N "$N"
   if [[ $BM_EXIT -ne 0 ]]; then
     pass "exited with code $BM_EXIT (non-zero) as expected"
   else
     fail "expected non-zero exit for --mode bogus, got 0"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 3: --mode ar exits 0 and produces throughput output
-# ---------------------------------------------------------------------------
-run_test "mode ar: exits 0 and reports throughput" bash -c '
+test_ar_throughput() {
   run_bm --mode ar \
-    --target-model '"$TARGET_MODEL"' \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"'
+    --target-model "$TARGET_MODEL" \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS"
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
     echo "    stderr: $(echo "$BM_STDERR" | head -5)"
     return
   fi
-  combined="$BM_STDOUT"$'"'"'\n'"'"'"$BM_STDERR"
+  local combined
+  combined="$(printf '%s\n%s' "$BM_STDOUT" "$BM_STDERR")"
   if echo "$combined" | grep -qi "throughput\|tok/s\|ms\|tokens"; then
     pass "output contains timing/throughput information"
   else
     fail "no throughput/timing info found in output"
     echo "    stdout: $(echo "$BM_STDOUT" | head -5)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 4: --mode ar --csv emits a RESULT, row
-# ---------------------------------------------------------------------------
-run_test "mode ar: --csv emits RESULT, row" bash -c '
+test_ar_csv() {
   run_bm --mode ar \
-    --target-model '"$TARGET_MODEL"' \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"' \
+    --target-model "$TARGET_MODEL" \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS" \
     --csv
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
@@ -148,38 +149,33 @@ run_test "mode ar: --csv emits RESULT, row" bash -c '
     fail "no RESULT, row found in stdout"
     echo "    stdout: $(echo "$BM_STDOUT" | head -5)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 5: --mode sd exits 0 and produces throughput output
-# ---------------------------------------------------------------------------
-run_test "mode sd: exits 0 and reports throughput" bash -c '
+test_sd_throughput() {
   run_bm --mode sd \
-    --target-model '"$TARGET_MODEL"' --draft-model '"$DRAFT_MODEL"' \
-    --K '"$K"' --alpha 0.9 \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"'
+    --target-model "$TARGET_MODEL" --draft-model "$DRAFT_MODEL" \
+    --K "$K" --alpha 0.9 \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS"
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
     echo "    stderr: $(echo "$BM_STDERR" | head -5)"
     return
   fi
-  combined="$BM_STDOUT"$'"'"'\n'"'"'"$BM_STDERR"
+  local combined
+  combined="$(printf '%s\n%s' "$BM_STDOUT" "$BM_STDERR")"
   if echo "$combined" | grep -qi "throughput\|tok/s\|ms\|tokens"; then
     pass "output contains timing/throughput information"
   else
     fail "no throughput/timing info found"
     echo "    stdout: $(echo "$BM_STDOUT" | head -5)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 6: --mode sd --csv emits a RESULT, row
-# ---------------------------------------------------------------------------
-run_test "mode sd: --csv emits RESULT, row" bash -c '
+test_sd_csv() {
   run_bm --mode sd \
-    --target-model '"$TARGET_MODEL"' --draft-model '"$DRAFT_MODEL"' \
-    --K '"$K"' --alpha 0.9 \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"' \
+    --target-model "$TARGET_MODEL" --draft-model "$DRAFT_MODEL" \
+    --K "$K" --alpha 0.9 \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS" \
     --csv
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
@@ -192,38 +188,33 @@ run_test "mode sd: --csv emits RESULT, row" bash -c '
     fail "no RESULT, row found in stdout"
     echo "    stdout: $(echo "$BM_STDOUT" | head -5)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 7: --mode ssd-single exits 0 and produces throughput output
-# ---------------------------------------------------------------------------
-run_test "mode ssd-single: exits 0 and reports throughput" bash -c '
+test_ssd_throughput() {
   run_bm --mode ssd-single \
-    --target-model '"$TARGET_MODEL"' --draft-model '"$DRAFT_MODEL"' \
-    --K '"$K"' --F '"$F"' --alpha 0.9 --phit 0.85 \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"'
+    --target-model "$TARGET_MODEL" --draft-model "$DRAFT_MODEL" \
+    --K "$K" --F "$F" --alpha 0.9 --phit 0.85 \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS"
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
     echo "    stderr: $(echo "$BM_STDERR" | head -5)"
     return
   fi
-  combined="$BM_STDOUT"$'"'"'\n'"'"'"$BM_STDERR"
+  local combined
+  combined="$(printf '%s\n%s' "$BM_STDOUT" "$BM_STDERR")"
   if echo "$combined" | grep -qi "throughput\|tok/s\|ms\|tokens"; then
     pass "output contains timing/throughput information"
   else
     fail "no throughput/timing info found"
     echo "    stdout: $(echo "$BM_STDOUT" | head -5)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 8: --mode ssd-single --csv emits a RESULT, row
-# ---------------------------------------------------------------------------
-run_test "mode ssd-single: --csv emits RESULT, row" bash -c '
+test_ssd_csv() {
   run_bm --mode ssd-single \
-    --target-model '"$TARGET_MODEL"' --draft-model '"$DRAFT_MODEL"' \
-    --K '"$K"' --F '"$F"' --alpha 0.9 --phit 0.85 \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"' \
+    --target-model "$TARGET_MODEL" --draft-model "$DRAFT_MODEL" \
+    --K "$K" --F "$F" --alpha 0.9 --phit 0.85 \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS" \
     --csv
   if [[ $BM_EXIT -ne 0 ]]; then
     fail "exit code $BM_EXIT, expected 0"
@@ -236,16 +227,14 @@ run_test "mode ssd-single: --csv emits RESULT, row" bash -c '
     fail "no RESULT, row found in stdout"
     echo "    stdout: $(echo "$BM_STDOUT" | head -5)"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 9: CSV header columns match RESULT row column count
-# ---------------------------------------------------------------------------
-run_test "csv-header and RESULT row have the same column count" bash -c '
-  header_line="$('"$BINARY"' --csv-header 2>/dev/null | head -1)"
-  result_line="$('"$BINARY"' --mode ar \
-      --target-model '"$TARGET_MODEL"' \
-      --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"' \
+test_csv_column_alignment() {
+  local header_line result_line hcols rcols
+  header_line="$("$BINARY" --csv-header 2>/dev/null | head -1)"
+  result_line="$("$BINARY" --mode ar \
+      --target-model "$TARGET_MODEL" \
+      --N "$N" --warmup "$WARMUP" --iters "$ITERS" \
       --csv 2>/dev/null | grep "^RESULT," | head -1)"
 
   if [[ -z "$header_line" || -z "$result_line" ]]; then
@@ -253,8 +242,8 @@ run_test "csv-header and RESULT row have the same column count" bash -c '
     return
   fi
 
-  hcols=$(echo "$header_line" | awk -F, "{print NF}")
-  rcols=$(echo "$result_line" | awk -F, "{print NF}")
+  hcols=$(echo "$header_line" | awk -F, '{print NF}')
+  rcols=$(echo "$result_line" | awk -F, '{print NF}')
 
   if [[ "$hcols" -eq "$rcols" ]]; then
     pass "header and RESULT row both have $hcols columns"
@@ -263,21 +252,32 @@ run_test "csv-header and RESULT row have the same column count" bash -c '
     echo "    header : $header_line"
     echo "    result : $result_line"
   fi
-'
+}
 
-# ---------------------------------------------------------------------------
-# Test 10: --mode ssd-single --tp 2 returns non-zero (rejects invalid TP)
-# ---------------------------------------------------------------------------
-run_test "mode ssd-single rejects --tp 2 with non-zero exit" bash -c '
+test_ssd_single_invalid_tp() {
   run_bm --mode ssd-single --tp 2 \
-    --target-model '"$TARGET_MODEL"' --draft-model '"$DRAFT_MODEL"' \
-    --N '"$N"' --warmup '"$WARMUP"' --iters '"$ITERS"'
+    --target-model "$TARGET_MODEL" --draft-model "$DRAFT_MODEL" \
+    --N "$N" --warmup "$WARMUP" --iters "$ITERS"
   if [[ $BM_EXIT -ne 0 ]]; then
     pass "exited with code $BM_EXIT (non-zero) as expected"
   else
     fail "expected non-zero exit for --tp 2 with ssd-single, got 0"
   fi
-'
+}
+
+# ---------------------------------------------------------------------------
+# Test Runner
+# ---------------------------------------------------------------------------
+run_test "csv-header prints header and exits 0" test_csv_header
+run_test "invalid --mode bogus returns non-zero" test_invalid_mode
+run_test "mode ar: exits 0 and reports throughput" test_ar_throughput
+run_test "mode ar: --csv emits RESULT, row" test_ar_csv
+run_test "mode sd: exits 0 and reports throughput" test_sd_throughput
+run_test "mode sd: --csv emits RESULT, row" test_sd_csv
+run_test "mode ssd-single: exits 0 and reports throughput" test_ssd_throughput
+run_test "mode ssd-single: --csv emits RESULT, row" test_ssd_csv
+run_test "csv-header and RESULT row have the same column count" test_csv_column_alignment
+run_test "mode ssd-single rejects --tp 2 with non-zero exit" test_ssd_single_invalid_tp
 
 # ---------------------------------------------------------------------------
 # Summary
