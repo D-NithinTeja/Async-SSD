@@ -107,6 +107,8 @@ inline const std::unordered_map<std::string, ModelConfig>& model_registry() {
   static const std::unordered_map<std::string, ModelConfig> models = {
     {"tiny",      {"Tiny",          512,  8,  4, 64, 2048,  4}},
     {"llama-1b",  {"Llama-3.2-1B",  2048, 32, 8,  64,  8192, 16}},
+    {"llama-2b",  {"Llama-3.2-2B",  2048, 32, 8,  64,  8192, 24}},
+    {"llama-3b",  {"Llama-3.2-3B",  3072, 24, 8, 128,  8192, 20}},
     {"llama-8b",  {"Llama-3.1-8B",  4096, 32, 8, 128, 14336, 32}},
     {"llama-70b", {"Llama-3.1-70B", 8192, 64, 8, 128, 28672, 80}},
   };
