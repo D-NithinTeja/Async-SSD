@@ -1,6 +1,7 @@
 // bench_ssd_single.cu
 // SSD benchmark scheduling on one GPU with blocking host-memory queues.
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -221,6 +222,8 @@ static BenchResult bench_ssd_e2e_single(
         draft_ready.record(stream.get());
 
         OutcomeMessage outcome = target_to_draft.pop();
+        // draft_ready.synchronize() is called BEFORE checking outcome.done,
+        // so GPU work is always fully retired before we act on the result.
         draft_ready.synchronize();
         if (outcome.done)
           break;
@@ -234,6 +237,9 @@ static BenchResult bench_ssd_e2e_single(
         draft_to_target.push(make_spec_message(K));
       }
     }
+    // Issue #2/#3: final stream sync ensures no GPU kernels are orphaned
+    // after the last iteration's speculative fanout work completes.
+    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
     total_misses = local_misses;
   });
 
@@ -287,11 +293,24 @@ static BenchResult bench_ssd_e2e_single(
     total_rounds = local_rounds_total;
   });
 
+  // Issue #3: Outer wall-clock timing that covers BOTH thread joins.
+  // This captures any draft-thread tail work that completes after the target
+  // thread records its stop timestamp, giving a true end-to-end measurement.
+  // The target-thread-only elapsed time is retained below for comparison.
+  const auto e2e_wall_start = std::chrono::steady_clock::now();
   draft_worker.join();
   target_worker.join();
+  const auto e2e_wall_stop = std::chrono::steady_clock::now();
+  const float e2e_wall_ms =
+    std::chrono::duration<float, std::milli>(e2e_wall_stop - e2e_wall_start).count();
 
+  // target_elapsed_ms: time measured inside the target thread only (inner).
+  // e2e_wall_ms:       wall-clock from just before join() to after both
+  //                    threads have returned (outer, includes draft tail).
+  // We report the larger of the two as the canonical e2e latency per iter,
+  // guaranteeing we never under-report when draft tail work dominates.
   BenchResult br;
-  br.e2e_ms = target_elapsed_ms / bench_iters;
+  br.e2e_ms = std::max(target_elapsed_ms, e2e_wall_ms) / bench_iters;
   br.avg_tokens = static_cast<float>(total_tokens) / bench_iters;
   br.avg_rounds = static_cast<float>(total_rounds) / bench_iters;
   br.miss_rate = total_rounds > 0
