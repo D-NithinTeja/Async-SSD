@@ -1,14 +1,35 @@
-# Benchmark sbatch scripts (Bridges-2 V100-32)
+# scripts/
 
-These scripts produce the data for the plots listed in Section 3 (Poster
-Session) of the milestone report. Each sweep writes a single CSV under
-`results/`.
+Scripts are split into two groups: **local / single-GPU** scripts you can run
+on any machine with one CUDA GPU, and **PSC cluster** scripts that require a
+Bridges-2 V100 node and NCCL.
 
-Following PSC's [benchmarking guidance](https://www.psc.edu/resources/bridges-2/user-guide/#benchmarking), every script grabs a
-**whole `v100-32` node** (`-p GPU --gpus=v100-32:8`) so no other tenants
-share the node and timings stay clean.
+---
 
-## One-time setup
+## Local / single-GPU scripts
+
+| Script | Purpose |
+|--------|---------|
+| `run_single_gpu_sweep.sh` | Runs the full alpha × K sweep on a local GPU and writes `results/01_alpha_K.csv` |
+
+Run it as:
+
+```bash
+bash scripts/run_single_gpu_sweep.sh
+```
+
+---
+
+## PSC cluster scripts (Bridges-2, NCCL required)
+
+These scripts produce the data for the plots in the milestone report. Each
+sweep writes a single CSV under `results/`.
+
+Following PSC's [benchmarking guidance](https://www.psc.edu/resources/bridges-2/user-guide/#benchmarking),
+every script grabs a **whole `v100-32` node** (`-p GPU --gpus=v100-32:8`) so no
+other tenants share the node and timings stay clean.
+
+### One-time setup
 
 From a Bridges-2 login node:
 
@@ -25,7 +46,7 @@ sbatch scripts/build.sbatch      # builds ./benchmark with USE_NCCL=1
 If your conda install lives somewhere other than `~/miniconda3`, override
 `CONDA_BASE` (e.g. `CONDA_BASE=$PROJECT/miniconda3 sbatch ...`).
 
-## Running the sweeps
+### Running the sweeps
 
 Submit individually:
 
@@ -44,14 +65,13 @@ bash scripts/submit_all.sh
 ```
 
 Most knobs (model, TP, K, alpha grid, etc.) are environment variables at
-the top of each script, so can override without editing:
+the top of each script, so you can override without editing:
 
 ```bash
 TARGET=llama-70b TP=4 sbatch scripts/01_sweep_alpha_K.sbatch
 ```
 
-## What maps to which plot
-
+### What maps to which plot
 
 | Plot in the report                      | Script                            | Output CSV                 |
 | --------------------------------------- | --------------------------------- | -------------------------- |
@@ -63,5 +83,3 @@ TARGET=llama-70b TP=4 sbatch scripts/01_sweep_alpha_K.sbatch
 | 6. Roofline-style analysis              | `05_roofline.sbatch`              | `results/05_roofline.csv`  |
 | 7. Batch size scaling                   | *not yet supported*               | —                          |
 | 8. Throughput-latency Pareto frontier   | *not yet supported*               | —                          |
-
-
