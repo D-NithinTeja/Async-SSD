@@ -13,7 +13,7 @@ Works with matplotlib (PNG) if installed, and always produces standalone SVG plo
 and ASCII summary tables so it runs out-of-the-box in any Python 3 environment.
 
 Usage:
-  python3 analysis/plot_results.py [--results-dir results/] [--output-dir analysis/plots/]
+  python3 analysis/plot_results.py [--csv results/single_gpu_latest.csv] [--results-dir results/] [--output-dir analysis/plots/]
 """
 
 import argparse
@@ -24,20 +24,19 @@ import sys
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate Async-SSD benchmark analysis and plots.")
+    parser.add_argument("--csv", type=str, default="", help="Path to unified sweep CSV file (e.g., results/single_gpu_latest.csv)")
     parser.add_argument("--results-dir", type=str, default="results", help="Directory containing raw result CSVs")
     parser.add_argument("--output-dir", type=str, default="analysis/plots", help="Directory to save generated plots")
     return parser.parse_args()
 
 def load_csv(filepath):
     if not os.path.exists(filepath):
-        print(f"Warning: CSV not found: {filepath}")
         return []
     rows = []
     with open(filepath, mode="r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for r in reader:
             if r.get("tag") == "RESULT" or "mode" in r:
-                # Type conversions
                 row = dict(r)
                 for float_field in ["alpha", "phit", "target_step_ms", "target_verify_ms",
                                     "draft_step_ms", "draft_total_ms", "prespec_ms",
@@ -65,7 +64,6 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, filepath, widt
     plot_w = width - pad_left - pad_right
     plot_h = height - pad_top - pad_bottom
 
-    # Find bounds
     all_x = []
     all_y = []
     for s_name, points in series_dict.items():
@@ -100,7 +98,6 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, filepath, widt
         f'<text x="25" y="{pad_top+plot_h/2}" text-anchor="middle" font-size="12" fill="#475569" transform="rotate(-90 25 {pad_top+plot_h/2})">{y_label}</text>',
     ]
 
-    # Gridlines & Y-ticks
     ticks = 5
     for i in range(ticks + 1):
         y_val = min_y + (max_y - min_y) * (i / ticks)
@@ -108,7 +105,6 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, filepath, widt
         svg.append(f'<line x1="{pad_left}" y1="{py}" x2="{pad_left+plot_w}" y2="{py}" stroke="#e2e8f0" stroke-dasharray="4"/>')
         svg.append(f'<text x="{pad_left-10}" y="{py+4}" text-anchor="end" font-size="10" fill="#64748b">{y_val:.1f}</text>')
 
-    # Series lines & Legend
     leg_x = pad_left + plot_w + 20
     leg_y = pad_top + 20
     for idx, (s_name, points) in enumerate(series_dict.items()):
@@ -119,7 +115,6 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, filepath, widt
         for x, y in pts_sorted:
             svg.append(f'<circle cx="{tx(x):.1f}" cy="{ty(y):.1f}" r="4" fill="{color}" stroke="#ffffff" stroke-width="1.5"/>')
         
-        # Legend item
         svg.append(f'<line x1="{leg_x}" y1="{leg_y + idx*22}" x2="{leg_x+20}" y2="{leg_y + idx*22}" stroke="{color}" stroke-width="2.5"/>')
         svg.append(f'<circle cx="{leg_x+10}" cy="{leg_y + idx*22}" r="3" fill="{color}"/>')
         svg.append(f'<text x="{leg_x+28}" y="{leg_y + idx*22 + 4}" font-size="11" fill="#1e293b">{s_name}</text>')
@@ -191,31 +186,48 @@ def generate_svg_bar_chart(title, categories, values_dict, filepath, width=700, 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(svg))
 
-def render_plots(results_dir, output_dir):
+def render_plots(csv_file, results_dir, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-    has_mpl = False
-    try:
-        import matplotlib.pyplot as plt
-        has_mpl = True
-    except ImportError:
-        pass
+
+    all_rows = []
+    if csv_file and os.path.exists(csv_file):
+        print(f"Loading data from specified CSV: {csv_file}")
+        all_rows = load_csv(csv_file)
+    elif os.path.exists(os.path.join(results_dir, "single_gpu_latest.csv")):
+        unified = os.path.join(results_dir, "single_gpu_latest.csv")
+        print(f"Loading data from latest single-GPU sweep: {unified}")
+        all_rows = load_csv(unified)
+
+    if not all_rows:
+        print(f"Loading individual CSV files from: {results_dir}")
+        rows_01 = load_csv(os.path.join(results_dir, "01_alpha_K.csv"))
+        rows_02 = load_csv(os.path.join(results_dir, "02_phit.csv"))
+        rows_03 = load_csv(os.path.join(results_dir, "03_fanout.csv"))
+        rows_04 = load_csv(os.path.join(results_dir, "04a_breakdown_small.csv"))
+    else:
+        rows_01 = all_rows
+        rows_02 = all_rows
+        rows_03 = all_rows
+        rows_04 = all_rows
+
+    target_name = all_rows[0].get("target", "Target") if all_rows else "Llama"
+    draft_name = all_rows[0].get("draft", "Draft") if all_rows else "Draft"
 
     # 1. Plot 1: Throughput vs Alpha
-    f_01 = os.path.join(results_dir, "01_alpha_K.csv")
-    rows_01 = load_csv(f_01)
     if rows_01:
-        # AR throughput baseline
         ar_thr = [r["throughput_tok_s"] for r in rows_01 if r["mode"] == "ar"]
-        baseline_ar = ar_thr[0] if ar_thr else 49.1
+        baseline_ar = ar_thr[0] if ar_thr else 50.0
 
-        # Group by mode and K=4
-        series = {"AR Baseline": [(a, baseline_ar) for a in [0.3, 0.5, 0.7, 0.9]]}
+        alphas = sorted(list(set(r["alpha"] for r in rows_01 if r["alpha"] > 0)))
+        series = {"AR Baseline": [(a, baseline_ar) for a in alphas]}
+
         sd_pts = [(r["alpha"], r["throughput_tok_s"]) for r in rows_01 if r["mode"] == "sd" and r["K"] == 4]
-        ssd_pts = [(r["alpha"], r["throughput_tok_s"]) for r in rows_01 if r["mode"] in ("ssd", "ssd-single") and r["K"] == 4]
+        ssd_pts = [(r["alpha"], r["throughput_tok_s"]) for r in rows_01 if r["mode"] in ("ssd", "ssd-single") and r["K"] == 4 and r.get("F", 1) in (1, 4)]
         if sd_pts:
-            series["SD (K=4)"] = sd_pts
+            # Deduplicate by alpha
+            series["SD (K=4)"] = sorted(dict(sd_pts).items())
         if ssd_pts:
-            series["SSD (K=4, F=4)"] = ssd_pts
+            series["Async-SSD (K=4)"] = sorted(dict(ssd_pts).items())
 
         svg_path = os.path.join(output_dir, "01_throughput_vs_alpha.svg")
         generate_svg_line_chart("Inference Throughput vs Acceptance Rate (α)", "Acceptance Rate α", "Throughput (tok/s)", series, svg_path)
@@ -223,84 +235,84 @@ def render_plots(results_dir, output_dir):
 
         # 2. Plot 2: Throughput vs K
         series_k = {}
-        for alpha_val in [0.7, 0.9]:
+        target_alphas = [0.7, 0.9] if any(abs(r["alpha"] - 0.7) < 0.05 for r in rows_01) else [alphas[-1]]
+        for alpha_val in target_alphas:
             sd_k = [(r["K"], r["throughput_tok_s"]) for r in rows_01 if r["mode"] == "sd" and abs(r["alpha"] - alpha_val) < 0.05]
-            ssd_k = [(r["K"], r["throughput_tok_s"]) for r in rows_01 if r["mode"] in ("ssd", "ssd-single") and abs(r["alpha"] - alpha_val) < 0.05]
+            ssd_k = [(r["K"], r["throughput_tok_s"]) for r in rows_01 if r["mode"] in ("ssd", "ssd-single") and abs(r["alpha"] - alpha_val) < 0.05 and r.get("F", 1) in (1, 4)]
             if sd_k:
-                series_k[f"SD (α={alpha_val})"] = sd_k
+                series_k[f"SD (α={alpha_val})"] = sorted(dict(sd_k).items())
             if ssd_k:
-                series_k[f"SSD (α={alpha_val})"] = ssd_k
+                series_k[f"SSD (α={alpha_val})"] = sorted(dict(ssd_k).items())
 
         svg_path_k = os.path.join(output_dir, "02_throughput_vs_K.svg")
         generate_svg_line_chart("Throughput vs Speculation Length (K)", "Speculation Length K", "Throughput (tok/s)", series_k, svg_path_k)
         print(f"Generated: {svg_path_k}")
 
     # 3. Plot 3: Throughput vs p_hit
-    f_02 = os.path.join(results_dir, "02_phit.csv")
-    rows_02 = load_csv(f_02)
     if rows_02:
-        ssd_phit = [(r["phit"], r["throughput_tok_s"]) for r in rows_02 if r["mode"] in ("ssd", "ssd-single")]
-        sd_row = [r["throughput_tok_s"] for r in rows_02 if r["mode"] == "sd"]
+        ssd_phit = [(r["phit"], r["throughput_tok_s"]) for r in rows_02 if r["mode"] in ("ssd", "ssd-single") and r["K"] == 4 and r["phit"] > 0]
+        sd_matches = [r["throughput_tok_s"] for r in rows_02 if r["mode"] == "sd" and r["K"] == 4]
+        sd_base = sd_matches[0] if sd_matches else 0.0
+        phits = sorted(list(set(p for p, _ in ssd_phit)))
+
         series_phit = {}
-        if sd_row:
-            series_phit["SD Baseline (K=4)"] = [(p, sd_row[0]) for p in [0.3, 0.5, 0.7, 0.85, 0.95]]
+        if sd_base > 0 and phits:
+            series_phit["SD Baseline (K=4)"] = [(p, sd_base) for p in phits]
         if ssd_phit:
-            series_phit["Async-SSD (K=4, F=4)"] = ssd_phit
+            series_phit["Async-SSD (K=4)"] = sorted(dict(ssd_phit).items())
 
         svg_path_phit = os.path.join(output_dir, "03_throughput_vs_phit.svg")
         generate_svg_line_chart("Throughput vs Cache Hit Rate (p_hit)", "Cache Hit Rate p_hit", "Throughput (tok/s)", series_phit, svg_path_phit)
         print(f"Generated: {svg_path_phit}")
 
     # 4. Plot 4: Throughput vs Fanout F
-    f_03 = os.path.join(results_dir, "03_fanout.csv")
-    rows_03 = load_csv(f_03)
     if rows_03:
         series_f = {}
-        for phit_val in [0.5, 0.7, 0.85, 0.95]:
-            f_pts = [(r["F"], r["throughput_tok_s"]) for r in rows_03 if abs(r["phit"] - phit_val) < 0.05]
+        avail_phits = sorted(list(set(r["phit"] for r in rows_03 if r["mode"] in ("ssd", "ssd-single") and r["F"] > 0)))
+        for phit_val in avail_phits:
+            f_pts = [(r["F"], r["throughput_tok_s"]) for r in rows_03 if abs(r["phit"] - phit_val) < 0.05 and r["F"] > 0]
             if f_pts:
-                series_f[f"p_hit={phit_val}"] = f_pts
+                series_f[f"p_hit={phit_val}"] = sorted(dict(f_pts).items())
         svg_path_f = os.path.join(output_dir, "04_throughput_vs_fanout.svg")
         generate_svg_line_chart("Throughput vs Pre-speculation Fanout (F)", "Fanout Degree F", "Throughput (tok/s)", series_f, svg_path_f)
         print(f"Generated: {svg_path_f}")
 
     # 5. Plot 5: Breakdown Chart
-    f_04 = os.path.join(results_dir, "04a_breakdown_small.csv")
-    rows_04 = load_csv(f_04)
     if rows_04:
-        cats = [f"{r['mode'].upper()} (K={r['K']})" for r in rows_04]
+        cand = [r for r in rows_04 if r["target_verify_ms"] > 0 or r["draft_total_ms"] > 0]
+        cats = [f"{r['mode'].upper()} (K={r['K']})" for r in cand[:6]]
         comps = {
-            "Draft Total": {f"{r['mode'].upper()} (K={r['K']})": r["draft_total_ms"] for r in rows_04},
-            "Pre-spec Fanout": {f"{r['mode'].upper()} (K={r['K']})": r["prespec_ms"] for r in rows_04},
-            "Target Verify": {f"{r['mode'].upper()} (K={r['K']})": r["target_verify_ms"] for r in rows_04},
+            "Draft Total": {f"{r['mode'].upper()} (K={r['K']})": r["draft_total_ms"] for r in cand[:6]},
+            "Pre-spec Fanout": {f"{r['mode'].upper()} (K={r['K']})": r["prespec_ms"] for r in cand[:6]},
+            "Target Verify": {f"{r['mode'].upper()} (K={r['K']})": r["target_verify_ms"] for r in cand[:6]},
         }
         svg_path_bd = os.path.join(output_dir, "05_latency_breakdown.svg")
         generate_svg_bar_chart("Component Latency Breakdown", cats, comps, svg_path_bd)
         print(f"Generated: {svg_path_bd}")
 
-    # Summary table in stdout
-    print("\n" + "=" * 78)
-    print("ASYNC-SSD BENCHMARK SUMMARY (Llama-3.1-8B Target + Llama-3.2-1B Draft)")
-    print("=" * 78)
-    print(f"{'Mode':<14} {'Config':<20} {'Throughput (tok/s)':<22} {'Speedup vs AR':<14}")
-    print("-" * 78)
+    # Summary table
+    print("\n" + "=" * 80)
+    print(f"ASYNC-SSD BENCHMARK SUMMARY ({target_name} Target + {draft_name} Draft)")
+    print("=" * 80)
+    print(f"{'Mode':<14} {'Config':<25} {'Throughput (tok/s)':<22} {'Speedup vs AR':<14}")
+    print("-" * 80)
     if rows_01:
-        ar_thr = next((r["throughput_tok_s"] for r in rows_01 if r["mode"] == "ar"), 49.11)
-        print(f"{'AR':<14} {'Baseline (M=1)':<20} {ar_thr:<22.2f} {'1.00x':<14}")
+        ar_thr_val = next((r["throughput_tok_s"] for r in rows_01 if r["mode"] == "ar"), 50.0)
+        print(f"{'AR':<14} {'Baseline (M=1)':<25} {ar_thr_val:<22.2f} {'1.00x':<14}")
 
         best_sd = max([r for r in rows_01 if r["mode"] == "sd"], key=lambda x: x["throughput_tok_s"], default=None)
         if best_sd:
             cfg = f"K={best_sd['K']}, alpha={best_sd['alpha']}"
-            sp = best_sd["throughput_tok_s"] / ar_thr
-            print(f"{'SD':<14} {cfg:<20} {best_sd['throughput_tok_s']:<22.2f} {f'{sp:.2f}x':<14}")
+            sp = best_sd["throughput_tok_s"] / ar_thr_val
+            print(f"{'SD':<14} {cfg:<25} {best_sd['throughput_tok_s']:<22.2f} {f'{sp:.2f}x':<14}")
 
         best_ssd = max([r for r in rows_01 if r["mode"] in ("ssd", "ssd-single")], key=lambda x: x["throughput_tok_s"], default=None)
         if best_ssd:
-            cfg = f"K={best_ssd['K']}, alpha={best_ssd['alpha']}, phit={best_ssd['phit']}"
-            sp = best_ssd["throughput_tok_s"] / ar_thr
-            print(f"{'Async-SSD':<14} {cfg:<20} {best_ssd['throughput_tok_s']:<22.2f} {f'{sp:.2f}x':<14}")
-    print("=" * 78 + "\n")
+            cfg = f"K={best_ssd['K']}, alpha={best_ssd['alpha']}, F={best_ssd['F']}, phit={best_ssd['phit']}"
+            sp = best_ssd["throughput_tok_s"] / ar_thr_val
+            print(f"{'Async-SSD':<14} {cfg:<25} {best_ssd['throughput_tok_s']:<22.2f} {f'{sp:.2f}x':<14}")
+    print("=" * 80 + "\n")
 
 if __name__ == "__main__":
     args = parse_args()
-    render_plots(args.results_dir, args.output_dir)
+    render_plots(args.csv, args.results_dir, args.output_dir)

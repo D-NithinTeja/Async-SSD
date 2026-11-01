@@ -6,43 +6,36 @@
 <line x1="80" y1="390.0" x2="540" y2="390.0" stroke="#e2e8f0" stroke-dasharray="4"/>
 <text x="70" y="394.0" text-anchor="end" font-size="10" fill="#64748b">0.0</text>
 <line x1="80" y1="324.0" x2="540" y2="324.0" stroke="#e2e8f0" stroke-dasharray="4"/>
-<text x="70" y="328.0" text-anchor="end" font-size="10" fill="#64748b">8.8</text>
+<text x="70" y="328.0" text-anchor="end" font-size="10" fill="#64748b">9.4</text>
 <line x1="80" y1="258.0" x2="540" y2="258.0" stroke="#e2e8f0" stroke-dasharray="4"/>
-<text x="70" y="262.0" text-anchor="end" font-size="10" fill="#64748b">17.6</text>
+<text x="70" y="262.0" text-anchor="end" font-size="10" fill="#64748b">18.8</text>
 <line x1="80" y1="192.0" x2="540" y2="192.0" stroke="#e2e8f0" stroke-dasharray="4"/>
-<text x="70" y="196.0" text-anchor="end" font-size="10" fill="#64748b">26.4</text>
+<text x="70" y="196.0" text-anchor="end" font-size="10" fill="#64748b">28.2</text>
 <line x1="80" y1="126.0" x2="540" y2="126.0" stroke="#e2e8f0" stroke-dasharray="4"/>
-<text x="70" y="130.0" text-anchor="end" font-size="10" fill="#64748b">35.2</text>
+<text x="70" y="130.0" text-anchor="end" font-size="10" fill="#64748b">37.7</text>
 <line x1="80" y1="60.0" x2="540" y2="60.0" stroke="#e2e8f0" stroke-dasharray="4"/>
-<text x="70" y="64.0" text-anchor="end" font-size="10" fill="#64748b">43.9</text>
-<text x="100.9" y="410" text-anchor="middle" font-size="11" fill="#334155">AR (K=0)</text>
-<rect x="132.3" y="293.3" width="20.9" height="96.7" fill="#3b82f6"/>
-<rect x="132.3" y="237.4" width="20.9" height="55.9" fill="#f59e0b"/>
-<text x="142.7" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=4)</text>
-<rect x="174.1" y="293.2" width="20.9" height="96.8" fill="#3b82f6"/>
-<rect x="174.1" y="188.7" width="20.9" height="104.6" fill="#10b981"/>
-<rect x="174.1" y="103.0" width="20.9" height="85.6" fill="#f59e0b"/>
-<text x="184.5" y="410" text-anchor="middle" font-size="11" fill="#334155">SSD (K=4)</text>
-<text x="226.4" y="410" text-anchor="middle" font-size="11" fill="#334155">AR (K=0)</text>
-<rect x="257.7" y="293.3" width="20.9" height="96.7" fill="#3b82f6"/>
-<rect x="257.7" y="237.4" width="20.9" height="55.9" fill="#f59e0b"/>
-<text x="268.2" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=4)</text>
-<rect x="299.5" y="293.2" width="20.9" height="96.8" fill="#3b82f6"/>
-<rect x="299.5" y="188.7" width="20.9" height="104.6" fill="#10b981"/>
-<rect x="299.5" y="103.0" width="20.9" height="85.6" fill="#f59e0b"/>
-<text x="310.0" y="410" text-anchor="middle" font-size="11" fill="#334155">SSD (K=4)</text>
-<text x="351.8" y="410" text-anchor="middle" font-size="11" fill="#334155">AR (K=0)</text>
-<rect x="383.2" y="293.3" width="20.9" height="96.7" fill="#3b82f6"/>
-<rect x="383.2" y="237.4" width="20.9" height="55.9" fill="#f59e0b"/>
-<text x="393.6" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=4)</text>
-<rect x="425.0" y="293.2" width="20.9" height="96.8" fill="#3b82f6"/>
-<rect x="425.0" y="188.7" width="20.9" height="104.6" fill="#10b981"/>
-<rect x="425.0" y="103.0" width="20.9" height="85.6" fill="#f59e0b"/>
-<text x="435.5" y="410" text-anchor="middle" font-size="11" fill="#334155">SSD (K=4)</text>
-<text x="477.3" y="410" text-anchor="middle" font-size="11" fill="#334155">AR (K=0)</text>
-<rect x="508.6" y="293.3" width="20.9" height="96.7" fill="#3b82f6"/>
-<rect x="508.6" y="237.4" width="20.9" height="55.9" fill="#f59e0b"/>
-<text x="519.1" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=4)</text>
+<text x="70" y="64.0" text-anchor="end" font-size="10" fill="#64748b">47.1</text>
+<rect x="99.2" y="378.6" width="38.3" height="11.4" fill="#3b82f6"/>
+<rect x="99.2" y="244.4" width="38.3" height="134.2" fill="#f59e0b"/>
+<text x="118.3" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=1)</text>
+<rect x="175.8" y="378.9" width="38.3" height="11.1" fill="#3b82f6"/>
+<rect x="175.8" y="367.7" width="38.3" height="11.1" fill="#10b981"/>
+<rect x="175.8" y="233.6" width="38.3" height="134.1" fill="#f59e0b"/>
+<text x="195.0" y="410" text-anchor="middle" font-size="11" fill="#334155">SSD-SINGLE (K=1)</text>
+<rect x="252.5" y="362.0" width="38.3" height="28.0" fill="#3b82f6"/>
+<rect x="252.5" y="228.8" width="38.3" height="133.2" fill="#f59e0b"/>
+<text x="271.7" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=2)</text>
+<rect x="329.2" y="366.2" width="38.3" height="23.8" fill="#3b82f6"/>
+<rect x="329.2" y="342.4" width="38.3" height="23.8" fill="#10b981"/>
+<rect x="329.2" y="209.2" width="38.3" height="133.3" fill="#f59e0b"/>
+<text x="348.3" y="410" text-anchor="middle" font-size="11" fill="#334155">SSD-SINGLE (K=2)</text>
+<rect x="405.8" y="328.6" width="38.3" height="61.4" fill="#3b82f6"/>
+<rect x="405.8" y="195.1" width="38.3" height="133.5" fill="#f59e0b"/>
+<text x="425.0" y="410" text-anchor="middle" font-size="11" fill="#334155">SD (K=4)</text>
+<rect x="482.5" y="313.3" width="38.3" height="76.7" fill="#3b82f6"/>
+<rect x="482.5" y="236.6" width="38.3" height="76.7" fill="#10b981"/>
+<rect x="482.5" y="103.0" width="38.3" height="133.6" fill="#f59e0b"/>
+<text x="501.7" y="410" text-anchor="middle" font-size="11" fill="#334155">SSD-SINGLE (K=4)</text>
 <rect x="560" y="80" width="14" height="14" fill="#3b82f6"/>
 <text x="582" y="91" font-size="11" fill="#1e293b">Draft Total</text>
 <rect x="560" y="102" width="14" height="14" fill="#10b981"/>

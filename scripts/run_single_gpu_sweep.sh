@@ -38,11 +38,11 @@ DRY_RUN=0
 QUICK=0
 OUTPUT_OVERRIDE=""
 
-TARGET_MODEL="llama-8b"
-DRAFT_MODEL="llama-1b"
+TARGET_MODEL="llama-2b"
+DRAFT_MODEL="llama-100m"
 N=128
-WARMUP=5
-ITERS=10
+WARMUP=2
+ITERS=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,7 +101,7 @@ PHITS=(0.5 0.7 0.85 0.95)
 # Fixed values used when a dimension is not being swept
 ALPHA_FIXED=0.9
 K_FIXED=4
-F_FIXED=4
+F_FIXED=1
 PHIT_FIXED=0.85
 
 # ---------------------------------------------------------------------------
@@ -303,6 +303,11 @@ for A in "${ALPHAS[@]}"; do
     --K "$K_FIXED" --F "$F_FIXED" --alpha "$A" --phit "$PHIT_FIXED" \
     --N "$N" --warmup "$WARMUP" --iters "$ITERS"
 done
+
+# Copy latest result
+if [[ $DRY_RUN -eq 0 ]]; then
+  cp "$OUTPUT" "$PROJECT_ROOT/results/single_gpu_latest.csv"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

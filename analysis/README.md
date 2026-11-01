@@ -47,3 +47,4 @@ python3 analysis/parse_profile.py --db ssd_single.sqlite
 - **Stream Execution Summary**: Kernel counts, overall timeline span, and mean kernel duration per stream.
 - **Concurrent Overlap**: Number of overlapping kernel pairs and cumulative concurrent execution time between worker streams.
 - **Synchronization Overhead**: Cumulative wait time across host threads spent in `cudaEventSynchronize` and `cudaStreamSynchronize`.
+

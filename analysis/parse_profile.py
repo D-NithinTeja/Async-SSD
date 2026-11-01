@@ -133,3 +133,4 @@ def analyze_profile(db_path):
 if __name__ == "__main__":
     args = parse_args()
     analyze_profile(args.db)
+

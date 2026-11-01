@@ -90,3 +90,4 @@ python3 analysis/parse_profile.py --db ssd_single.sqlite
 nsys profile --trace=cuda,osrt --output=my_profile ./benchmark --mode ssd-single ...
 python3 analysis/parse_profile.py --db my_profile.sqlite
 ```
+

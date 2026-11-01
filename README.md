@@ -86,8 +86,8 @@ make
 
 ```
 Options:
-  --target-model <name>   Target model (tiny, llama-1b, llama-8b, llama-70b)  [llama-8b]
-  --draft-model  <name>   Draft model  (tiny, llama-1b, llama-8b, llama-70b)  [llama-1b]
+  --target-model <name>   Target model (tiny, llama-100m, llama-1b, llama-2b, llama-3b, llama-8b, llama-70b)  [llama-2b]
+  --draft-model  <name>   Draft model  (tiny, llama-100m, llama-1b, llama-2b, llama-3b, llama-8b, llama-70b)  [llama-100m]
   --tp           <int>    Tensor parallelism degree                     [1]
   --mode         <str>    Inference mode (ar, sd, ssd, ssd-single)      [ar]
   --K            <int>    Speculation length (sd/ssd only)              [4]
@@ -107,6 +107,33 @@ Options:
 ---
 
 ## Results summary
+
+### 1. Local Single-GPU Validation (NVIDIA GeForce RTX 3050 Laptop GPU, 6GB)
+
+Measured directly on hardware using the full 61-point sweep in [`results/single_gpu_latest.csv`](results/single_gpu_latest.csv):
+
+#### Setup A: `llama-2b` Target (2.72 GB) + `llama-100m` Draft (0.14 GB) — Total: 2.86 GB
+| Mode | Config | E2E Time (128 tok) | Throughput (tok/s) | Speedup vs AR |
+|:---|:---|:---|:---|:---|
+| **AR** | Baseline ($M=1$) | 2,447.27 ms | **52.29** | $1.00\times$ |
+| **SD** | $K=4, \alpha=0.90$ | 845.24 ms | **154.51** | $2.95\times$ |
+| **SD** | $K=8, \alpha=0.90$ | 733.15 ms | **178.12** | $3.41\times$ |
+| **SSD-single** | $K=4, F=1, \alpha=0.90, p_{\text{hit}}=0.85$ | 764.91 ms | **170.73** | $3.26\times$ |
+| **SSD-single** | $K=8, F=1, \alpha=0.90, p_{\text{hit}}=0.85$ | 722.75 ms | **180.68** | **$3.46\times$ (Fastest)** |
+
+#### Setup B: `llama-3b` Target (3.75 GB) + `llama-100m` Draft (0.14 GB) — Total: 3.89 GB
+| Mode | Config | E2E Time (128 tok) | Throughput (tok/s) | Speedup vs AR |
+|:---|:---|:---|:---|:---|
+| **AR** | Baseline ($M=1$) | 3,325.46 ms | **38.49** | $1.00\times$ |
+| **SD** | $K=4, \alpha=0.90$ | 1,074.23 ms | **121.57** | $3.16\times$ |
+| **SSD-single** | $K=4, F=1, \alpha=0.90, p_{\text{hit}}=0.85$ | 984.94 ms | **132.60** | **$3.44\times$ (Fastest)** |
+
+> [!TIP]
+> **Single-GPU Fan-out Guideline ($F=1$ vs $F=4$)**: On a single GPU sharing memory bandwidth, linear pre-speculation ($F=1$) achieves the highest throughput by eliminating speculative branch waste. High fanout ($F=4$) is intended for **multi-GPU** deployments where draft and target execute on physically isolated memory buses.
+
+---
+
+### 2. Cluster Cluster Sweep Results (Bridges-2 V100-32)
 
 Representative throughput numbers from `results/01_alpha_K.csv`
 (Llama-3.1-8B target, Llama-3.2-1B draft, N=128, F=4, p\_hit=0.85):

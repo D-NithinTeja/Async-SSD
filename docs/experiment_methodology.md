@@ -50,10 +50,13 @@ Dimensions are matched to the real Llama-3 / Llama-3.2 architecture
 
 | Key | Name | d_model | n_heads | n_kv_heads | head_dim | d_ff | n_layers | Weight (FP16) |
 |-----|------|---------|---------|------------|----------|------|----------|----------------|
-| `tiny` | Tiny | 512 | 8 | 4 | 64 | 2048 | 4 | ~0.02 GB |
-| `llama-1b` | Llama-3.2-1B | 2048 | 32 | 8 | 64 | 8192 | 16 | ~1.0 GB |
-| `llama-8b` | Llama-3.1-8B | 4096 | 32 | 8 | 128 | 14336 | 32 | ~8.0 GB |
-| `llama-70b` | Llama-3.1-70B | 8192 | 64 | 8 | 128 | 28672 | 80 | ~70 GB |
+| `tiny` | Tiny | 512 | 8 | 4 | 64 | 2048 | 4 | ~0.03 GB |
+| `llama-100m` | Llama-100M | 768 | 12 | 4 | 64 | 2048 | 12 | ~0.14 GB |
+| `llama-1b` | Llama-3.2-1B | 2048 | 32 | 8 | 64 | 8192 | 16 | ~1.81 GB |
+| `llama-2b` | Llama-3.2-2B | 2048 | 32 | 8 | 64 | 8192 | 24 | ~2.72 GB |
+| `llama-3b` | Llama-3.2-3B | 3072 | 24 | 8 | 128 | 8192 | 20 | ~3.75 GB |
+| `llama-8b` | Llama-3.1-8B | 4096 | 32 | 8 | 128 | 14336 | 32 | ~13.0 GB |
+| `llama-70b` | Llama-3.1-70B | 8192 | 64 | 8 | 128 | 28672 | 80 | ~130 GB |
 
 > [!NOTE]
 > Weight bytes per layer = 2 × (d·d_q + d·d_kv + d·d_kv + d_q·d + d·d_ff + d·d_ff + d_ff·d).
